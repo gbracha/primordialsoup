@@ -2646,6 +2646,7 @@ DEFINE_PRIMITIVE(Behavior_adoptInstance) {
   }
   ASSERT(id->IsSmallInteger());
   instance->set_cid(id->value());
+  static_cast<RegularObject>(instance)->set_klass(new_cls);
 
   RETURN_SELF();
 }

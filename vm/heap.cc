@@ -148,11 +148,18 @@ void Heap::GCStep() {
         worklist_[i]->set_is_weak_referent(false);
       }
     } else {
+      bool includes_klass = false;
       for (intptr_t i = 0; i < worklist_size_; i++) {
+        if (worklist_[i]->in_class_table()) {
+          includes_klass = true;
+        }
         Unlink(worklist_[i]);
       }
       for (intptr_t i = 0; i < worklist_size_; i++) {
         Free(worklist_[i]);
+      }
+      if (includes_klass) {
+        interpreter_->ClearCache();
       }
     }
     worklist_size_ = 0;
@@ -183,10 +190,6 @@ bool Heap::CheckReachable(HeapObject obj) {
 
   for (intptr_t cursor = 0; cursor < worklist_size_; cursor++) {
     HeapObject obj = worklist_[cursor];
-
-    if (obj->in_class_table()) {
-      return true;
-    }
 
     for (intptr_t i = 0; i < handles_size_; i++) {
       if (*handles_[i] == obj) {
@@ -293,7 +296,10 @@ void Heap::Free(HeapObject obj) {
   ASSERT(obj->incoming()->IsEmpty());
 
   if (obj->in_class_table()) {
-    UNREACHABLE();
+    intptr_t cid = static_cast<Behavior>(obj)->id()->value();
+    ASSERT(class_table_[cid] == obj);
+    class_table_[cid] = SmallInteger::New(class_table_free_);
+    class_table_free_ = cid;
   }
 
   heap_size_ -= obj->HeapSize();
@@ -490,6 +496,26 @@ void Heap::InitializeAfterSnapshot() {
     }
     cls->set_in_class_table(true);
   }
+
+  for (intptr_t i = 1; i < table_size_; i++) {
+    HeapObject obj = table_[i];
+    if (obj->IsRegularObject() || obj->IsEphemeron()) {
+      Behavior klass = static_cast<Behavior>(class_table_[obj->cid()]);
+      static_cast<RegularObject>(obj)->init_klass(klass);
+    }
+  }
+
+#if defined(DEBUG)
+  for (intptr_t cid = kFirstLegalCid; cid < class_table_size_; cid++) {
+    Behavior cls = static_cast<Behavior>(class_table_[cid]);
+    ASSERT(cls->incoming()->next != cls->incoming());
+  }
+
+  for (intptr_t i = 1; i < table_size_; i++) {
+    HeapObject obj = table_[i];
+    ASSERT(obj->incoming()->next != obj->incoming());
+  }
+#endif
 }
 
 intptr_t Heap::CountInstances(intptr_t cid) {

@@ -257,7 +257,7 @@ class HeapObject : public Object {
     ASSERT(IsRegularObject());
     // 8 slots for a class, 7 slots for a metaclass, plus 1 header.
     intptr_t heap_slots = heap_size() / sizeof(Ref);
-    ASSERT((heap_slots == 8) || (heap_slots == 9));
+    ASSERT((heap_slots == 9) || (heap_slots == 10));
   }
 
   inline bool is_marked() const;
@@ -478,6 +478,8 @@ class RegularObject : public HeapObject {
   HEAP_OBJECT_IMPLEMENTATION(RegularObject, HeapObject);
 
  public:
+  inline void init_klass(Behavior value);
+  inline void set_klass(Behavior value);
   inline Object slot(intptr_t index) const;
   inline void init_slot(intptr_t index, Object value);
   inline void set_slot(intptr_t index, Object value);
@@ -826,6 +828,7 @@ class LargeInteger::Layout : public HeapObject::Layout {
 
 class RegularObject::Layout : public HeapObject::Layout {
  public:
+  Ref/*Behavior*/ klass_;
   Ref/*Object*/ slots_[];
 };
 
@@ -844,6 +847,7 @@ class WeakArray::Layout : public HeapObject::Layout {
 
 class Ephemeron::Layout : public HeapObject::Layout {
  public:
+  Ref/*Behavior*/ klass_;
   Ref/*Object*/ key_;
   Ref/*Object*/ value_;
   Ref/*Object*/ finalizer_;
@@ -861,6 +865,7 @@ class ByteArray::Layout : public Bytes::Layout {};
 
 class Method::Layout : public HeapObject::Layout {
  public:
+  Ref/*Behavior*/ klass_;
   Ref/*SmallInteger*/ header_;
   Ref/*Array*/ literals_;
   Ref/*ByteArray*/ bytecode_;
@@ -896,6 +901,7 @@ class Closure::Layout : public HeapObject::Layout {
 
 class Behavior::Layout : public HeapObject::Layout {
  public:
+  Ref/*Behavior*/ klass_;
   Ref/*Behavior*/ superclass_;
   Ref/*Array*/ methods_;
   Ref/*Object*/ enclosing_object_;
@@ -917,6 +923,7 @@ class Metaclass::Layout : public Behavior::Layout {
 
 class AbstractMixin::Layout : public HeapObject::Layout {
  public:
+  Ref/*Behavior*/ klass_;
   Ref/*String*/ name_;
   Ref/*Array*/ methods_;
   Ref/*AbstractMixin*/ enclosing_mixin_;
@@ -924,6 +931,7 @@ class AbstractMixin::Layout : public HeapObject::Layout {
 
 class Message::Layout : public HeapObject::Layout {
  public:
+  Ref/*Behavior*/ klass_;
   Ref/*String*/ selector_;
   Ref/*Array*/ arguments_;
 };
@@ -1085,6 +1093,12 @@ void LargeInteger::set_digit(intptr_t index, digit_t value) {
   ptr()->digits_[index] = value;
 }
 
+void RegularObject::init_klass(Behavior value) {
+  Init<Behavior>(&ptr()->klass_, value);
+}
+void RegularObject::set_klass(Behavior value) {
+  Store<Behavior>(&ptr()->klass_, value);
+}
 Object RegularObject::slot(intptr_t index) const {
   return Load<Object>(&ptr()->slots_[index]);
 }
@@ -1095,11 +1109,11 @@ void RegularObject::init_slot(intptr_t index, Object value) {
   Init<Object>(&ptr()->slots_[index], value);
 }
 Ref* RegularObject::from() {
-  return &ptr()->slots_[0];
+  return &ptr()->klass_;
 }
 Ref* RegularObject::to() {
   intptr_t num_slots =
-      (heap_size() - sizeof(HeapObject::Layout)) / sizeof(Ref);
+      (heap_size() - sizeof(RegularObject::Layout)) / sizeof(Ref);
   return &ptr()->slots_[num_slots - 1];
 }
 

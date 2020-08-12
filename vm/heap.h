@@ -71,13 +71,17 @@ class Heap {
                                       Allocator allocator = kNormal) {
     ASSERT(cid == kEphemeronCid || cid >= kFirstRegularObjectCid);
     const intptr_t heap_size =
-        AllocationSize(num_slots * sizeof(Ref) + sizeof(HeapObject::Layout));
+        AllocationSize(num_slots * sizeof(Ref) + sizeof(RegularObject::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, cid, heap_size);
     RegisterInstance(obj);
     RegularObject result = static_cast<RegularObject>(obj);
     ASSERT(result->IsRegularObject() || result->IsEphemeron());
     ASSERT(result->HeapSize() == heap_size);
+    if (allocator != kSnapshot) {
+      static_cast<Behavior>(class_table_[cid])->AssertCouldBeBehavior();
+      result->init_klass(static_cast<Behavior>(class_table_[cid]));
+    }
     return result;
   }
 
