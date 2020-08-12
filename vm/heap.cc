@@ -100,7 +100,10 @@ Heap::Heap() :
     handles_(),
     handles_size_(0),
     ephemeron_list_(nullptr),
-    weak_list_(nullptr) {
+    weak_list_(nullptr),
+    max_gc_time_(0),
+    total_gc_time_(0),
+    gc_count_(0) {
   to_.Allocate(kInitialSemispaceCapacity);
   from_.Allocate(kInitialSemispaceCapacity);
   top_ = to_.object_start();
@@ -134,6 +137,11 @@ Heap::~Heap() {
   }
   delete[] remembered_set_;
   delete[] class_table_;
+
+  OS::PrintErr("max-gc: %" Pd64 " ns, "
+               "total-gc: %" Pd64 " ns, "
+               "gc-count: %" Pd "\n",
+               max_gc_time_, total_gc_time_, gc_count_);
 }
 
 Message Heap::AllocateMessage() {
@@ -321,6 +329,7 @@ void Heap::ShrinkRememberedSet() {
 }
 
 void Heap::Scavenge(Reason reason) {
+  int64_t start = OS::CurrentMonotonicNanos();
 #if REPORT_GC
   int64_t start = OS::CurrentMonotonicNanos();
   size_t new_before = top_ - to_.object_start();
@@ -379,6 +388,13 @@ void Heap::Scavenge(Reason reason) {
                ReasonToCString(reason), new_after / KB, tenured / KB,
                freed / KB, time / kNanosecondsPerMicrosecond);
 #endif
+  int64_t stop = OS::CurrentMonotonicNanos();
+  int64_t time = stop - start;
+  if (time > max_gc_time_) {
+    max_gc_time_ = time;
+  }
+  total_gc_time_ += time;
+  gc_count_++;
 
   ASSERT(reason == kNewSpace ||
          reason == kClassTable ||
@@ -626,6 +642,7 @@ void Heap::ScavengeClass(intptr_t cid) {
 }
 
 void Heap::MarkSweep(Reason reason) {
+  int64_t start = OS::CurrentMonotonicNanos();
 #if REPORT_GC
   int64_t start = OS::CurrentMonotonicNanos();
   size_t size_before = old_size_;
@@ -680,6 +697,15 @@ void Heap::MarkSweep(Reason reason) {
                (size_before - size_after) / KB,
                time / kNanosecondsPerMicrosecond);
 #endif
+
+  int64_t stop = OS::CurrentMonotonicNanos();
+  int64_t time = stop - start;
+  if (time > max_gc_time_) {
+    max_gc_time_ = time;
+  }
+  total_gc_time_ += time;
+  gc_count_++;
+
 }
 
 void Heap::MarkRoots() {

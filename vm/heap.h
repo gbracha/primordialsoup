@@ -442,6 +442,10 @@ class Heap {
   Ephemeron ephemeron_list_;
   WeakArray weak_list_;
 
+  int64_t max_gc_time_;
+  int64_t total_gc_time_;
+  intptr_t gc_count_;
+
   DISALLOW_COPY_AND_ASSIGN(Heap);
 };
 
