@@ -12,6 +12,14 @@
 
 namespace psoup {
 
+INLINE static const uint8_t* Unhide(const uint8_t* ip) {
+  return (const uint8_t*)(((uword)ip)>>1);
+}
+INLINE static const uint8_t* Hide(const uint8_t* ip) {
+  ASSERT((uword)ip<<1>>1 == (uword)ip);
+  return (const uint8_t*)(((uword)ip)<<1);
+}
+
 enum PointerBits {
   kSmiTag = 0,
   kHeapObjectTag = 1,
@@ -21,28 +29,24 @@ enum PointerBits {
 };
 
 enum ObjectAlignment {
-  // Alignment offsets are used to determine object age.
-  kNewObjectAlignmentOffset = kWordSize,
-  kOldObjectAlignmentOffset = 0,
   // Object sizes are aligned to kObjectAlignment.
-  kObjectAlignment = 2 * kWordSize,
+  kObjectAlignment = 4 * kWordSize,
   kObjectAlignmentLog2 = kWordSizeLog2 + 1,
   kObjectAlignmentMask = kObjectAlignment - 1,
-
-  kNewObjectBits = kNewObjectAlignmentOffset | kHeapObjectTag,
-  kOldObjectBits = kOldObjectAlignmentOffset | kHeapObjectTag,
 };
 
 enum HeaderBits {
-  // New object: Already copied to to-space (is forwarding pointer).
-  // Old object: Already seen by the marker (is gray or black).
+  // In the backtracing worklist.
   kMarkBit = 0,
 
-  // In remembered set.
-  kRememberedBit = 1,
+  // Saw a WeakArray pointing to this.
+  kWeakReferentBit = 1,
+
+  // Registered in the class table.
+  kInClassTableBit = 2,
 
   // For symbols.
-  kCanonicalBit = 2,
+  kCanonicalBit = 3,
 
 #if defined(ARCH_IS_32_BIT)
   kSizeFieldOffset = 8,
@@ -77,11 +81,6 @@ enum ClassIds {
   kClosureCid = 13,
 
   kFirstRegularObjectCid = 14,
-};
-
-enum Barrier {
-  kNoBarrier,
-  kBarrier
 };
 
 class Heap;
@@ -148,19 +147,6 @@ class Object {
   bool IsSmallInteger() const {
     return (tagged_pointer_ & kSmiTagMask) == kSmiTag;
   }
-  bool IsOldObject() const {
-    return (tagged_pointer_ & kObjectAlignmentMask) == kOldObjectBits;
-  }
-  bool IsNewObject() const {
-    return (tagged_pointer_ & kObjectAlignmentMask) == kNewObjectBits;
-  }
-  // Like !IsHeapObject() || IsOldObject(), but compiles to a single branch.
-  bool IsImmediateOrOldObject() const {
-    return (tagged_pointer_ & kObjectAlignmentMask) != kNewObjectBits;
-  }
-  bool IsImmediateOrNewObject() const {
-    return (tagged_pointer_ & kObjectAlignmentMask) != kOldObjectBits;
-  }
 
   inline intptr_t ClassId() const;
   Behavior Klass(Heap* heap) const;
@@ -200,6 +186,68 @@ class Object {
   uword tagged_pointer_;
 };
 
+class Link {
+ public:
+  Link* prev;
+  Link* next;
+
+  void Init() {
+    prev = this;
+    next = this;
+  }
+
+  bool IsEmpty() const {
+    return next == this;
+  }
+
+  void Insert(Link* new_link) {
+    ASSERT(new_link->next == new_link);
+    ASSERT(new_link->prev == new_link);
+
+    Link* before = prev;
+    Link* after = this;
+
+    before->next = new_link;
+    new_link->prev = before;
+
+    after->prev = new_link;
+    new_link->next = after;
+  }
+
+  void Remove() {
+    ASSERT(next != this);
+    ASSERT(prev != this);
+
+    Link* before = prev;
+    Link* after = next;
+    before->next = after;
+    after->prev = before;
+
+#if defined(DEBUG)
+    prev = this;
+    next = this;
+#endif
+  }
+
+  void Poison() {
+#if defined(DEBUG)
+    prev = nullptr;
+    next = nullptr;
+#endif
+  }
+};
+
+class Ref : public Link {
+ public:
+  Object from;
+  Object to;
+
+  inline void InitRoot(Object target);
+  inline void Init(Object source, Object target);
+  inline void Update(Object source, Object target);
+  inline void UpdateNoCheck(Object target);
+};
+
 class HeapObject : public Object {
   HEAP_OBJECT_IMPLEMENTATION(HeapObject, Object);
 
@@ -208,14 +256,16 @@ class HeapObject : public Object {
     ASSERT(IsHeapObject());
     ASSERT(IsRegularObject());
     // 8 slots for a class, 7 slots for a metaclass, plus 1 header.
-    intptr_t heap_slots = heap_size() / sizeof(uword);
-    ASSERT((heap_slots == 8) || (heap_slots == 10));
+    intptr_t heap_slots = heap_size() / sizeof(Ref);
+    ASSERT((heap_slots == 8) || (heap_slots == 9));
   }
 
   inline bool is_marked() const;
   inline void set_is_marked(bool value);
-  inline bool is_remembered() const;
-  inline void set_is_remembered(bool value);
+  inline bool is_weak_referent() const;
+  inline void set_is_weak_referent(bool value);
+  inline bool in_class_table() const;
+  inline void set_in_class_table(bool value);
   inline bool is_canonical() const;
   inline void set_is_canonical(bool value);
   inline intptr_t heap_size() const;
@@ -223,6 +273,9 @@ class HeapObject : public Object {
   inline void set_cid(intptr_t value);
   inline intptr_t header_hash() const;
   inline void set_header_hash(intptr_t value);
+  inline intptr_t table_index() const;
+  inline void set_table_index(intptr_t value);
+  inline Link* incoming();
 
   uword Addr() const {
     return tagged_pointer_ - kHeapObjectTag;
@@ -244,37 +297,36 @@ class HeapObject : public Object {
     return HeapSizeFromClass();
   }
   intptr_t HeapSizeFromClass() const;
-  void Pointers(Object** from, Object** to);
+  void Pointers(Ref** from, Ref** to);
 
  protected:
   template<typename type>
-  type Load(type* addr, Barrier barrier = kBarrier) const {
-    return *addr;
+  type Load(const Ref* addr) const {
+    return static_cast<type>(const_cast<Ref*>(addr)->to);
   }
 
   template<typename type>
-  void Store(type* addr, type value, Barrier barrier) {
-    *addr = value;
-    if (barrier == kNoBarrier) {
-      ASSERT(value->IsImmediateOrOldObject());
-    } else {
-      // Generational write barrier:
-      if (IsOldObject() && value->IsNewObject() && !is_remembered()) {
-        AddToRememberedSet();
-      }
-    }
+  void Store(Ref* addr, type value) {
+    addr->Update(*this, value);
+  }
+
+  template<typename type>
+  void Init(Ref* addr, type value) {
+    addr->Init(*this, value);
   }
 
  private:
-  void AddToRememberedSet() const;
-
   class MarkBit : public BitField<bool, kMarkBit, 1> {};
-  class RememberedBit : public BitField<bool, kRememberedBit, 1> {};
+  class WeakReferentBit : public BitField<bool, kWeakReferentBit, 1> {};
+  class InClassTableBit : public BitField<bool, kInClassTableBit, 1> {};
   class CanonicalBit : public BitField<bool, kCanonicalBit, 1> {};
   class SizeField :
       public BitField<intptr_t, kSizeFieldOffset, kSizeFieldSize> {};
   class ClassIdField :
       public BitField<intptr_t, kClassIdFieldOffset, kClassIdFieldSize> {};
+
+  class IndexField : public BitField<intptr_t, 0, 32> {};
+  class HashField : public BitField<intptr_t, 32, 32> {};
 };
 
 intptr_t Object::ClassId() const {
@@ -427,11 +479,11 @@ class RegularObject : public HeapObject {
 
  public:
   inline Object slot(intptr_t index) const;
-  inline void set_slot(intptr_t index, Object value,
-                       Barrier barrier = kBarrier);
+  inline void init_slot(intptr_t index, Object value);
+  inline void set_slot(intptr_t index, Object value);
 
-  inline Object* from();
-  inline Object* to();
+  inline Ref* from();
+  inline Ref* to();
 };
 
 class Array : public HeapObject {
@@ -440,14 +492,15 @@ class Array : public HeapObject {
  public:
   inline SmallInteger size() const;
   inline void set_size(SmallInteger s);
+  inline void init_size(SmallInteger s);
   intptr_t Size() const { return size()->value(); }
 
   inline Object element(intptr_t index) const;
-  inline void set_element(intptr_t index, Object value,
-                          Barrier barrier = kBarrier);
+  inline void set_element(intptr_t index, Object value);
+  inline void init_element(intptr_t index, Object value);
 
-  inline Object* from();
-  inline Object* to();
+  inline Ref* from();
+  inline Ref* to();
 };
 
 class WeakArray : public HeapObject {
@@ -456,6 +509,7 @@ class WeakArray : public HeapObject {
  public:
   inline SmallInteger size() const;
   inline void set_size(SmallInteger s);
+  inline void init_size(SmallInteger s);
   intptr_t Size() const { return size()->value(); }
 
   // Only accessed by the GC. Bypasses barrier, including assertions.
@@ -463,11 +517,11 @@ class WeakArray : public HeapObject {
   inline void set_next(WeakArray value);
 
   inline Object element(intptr_t index) const;
-  inline void set_element(intptr_t index, Object value,
-                          Barrier barrier = kBarrier);
+  inline void set_element(intptr_t index, Object value);
+  inline void init_element(intptr_t index, Object value);
 
-  inline Object* from();
-  inline Object* to();
+  inline Ref* from();
+  inline Ref* to();
 };
 
 class Ephemeron : public HeapObject {
@@ -475,23 +529,19 @@ class Ephemeron : public HeapObject {
 
  public:
   inline Object key() const;
-  inline Object* key_ptr();
-  inline void set_key(Object key, Barrier barrier = kBarrier);
+  inline void set_key(Object key);
+  inline void init_key(Object key);
 
   inline Object value() const;
-  inline Object* value_ptr();
-  inline void set_value(Object value, Barrier barrier = kBarrier);
+  inline void set_value(Object value);
+  inline void init_value(Object value);
 
   inline Object finalizer() const;
-  inline Object* finalizer_ptr();
-  inline void set_finalizer(Object finalizer, Barrier barrier = kBarrier);
+  inline void set_finalizer(Object finalizer);
+  inline void init_finalizer(Object finalizer);
 
-  // Only accessed by the GC. Bypasses barrier, including assertions.
-  inline Ephemeron next() const;
-  inline void set_next(Ephemeron value);
-
-  inline Object* from();
-  inline Object* to();
+  inline Ref* from();
+  inline Ref* to();
 };
 
 class Bytes : public HeapObject {
@@ -500,6 +550,7 @@ class Bytes : public HeapObject {
  public:
   inline SmallInteger size() const;
   inline void set_size(SmallInteger s);
+  inline void init_size(SmallInteger s);
   intptr_t Size() const { return size()->value(); }
 
   inline uint8_t element(intptr_t index) const;
@@ -526,34 +577,46 @@ class Activation : public HeapObject {
 
  public:
   inline Activation sender() const;
-  inline void set_sender(Activation s, Barrier barrier = kBarrier);
-  Object* sender_fp() const {
-    return reinterpret_cast<Object*>(static_cast<uword>(sender()));
+  inline void set_sender(Activation s);
+  inline void init_sender(Activation s);
+  Ref* sender_fp() const {
+    return reinterpret_cast<Ref*>(static_cast<uword>(sender()));
   }
-  void set_sender_fp(Object* fp) {
+  void set_sender_fp(Ref* fp) {
     Activation sender = static_cast<Activation>(reinterpret_cast<uword>(fp));
     ASSERT(sender->IsSmallInteger());
-    set_sender(sender, kNoBarrier);
+    set_sender(sender);
+  }
+  void init_sender_fp(Ref* fp) {
+    Activation sender = static_cast<Activation>(reinterpret_cast<uword>(fp));
+    ASSERT(sender->IsSmallInteger());
+    init_sender(sender);
   }
 
   inline SmallInteger bci() const;
   inline void set_bci(SmallInteger i);
+  inline void init_bci(SmallInteger i);
 
   inline Method method() const;
-  inline void set_method(Method m, Barrier barrier = kBarrier);
+  inline void set_method(Method m);
+  inline void init_method(Method m);
 
   inline Closure closure() const;
-  inline void set_closure(Closure m, Barrier barrier = kBarrier);
+  inline void set_closure(Closure m);
+  inline void init_closure(Closure m);
 
   inline Object receiver() const;
-  inline void set_receiver(Object o, Barrier barrier = kBarrier);
+  inline void set_receiver(Object o);
+  inline void init_receiver(Object o);
 
   inline SmallInteger stack_depth() const;
   inline void set_stack_depth(SmallInteger d);
+  inline void init_stack_depth(SmallInteger d);
   intptr_t StackDepth() const { return stack_depth()->value(); }
 
   inline Object temp(intptr_t index) const;
-  inline void set_temp(intptr_t index, Object o, Barrier barrier = kBarrier);
+  inline void set_temp(intptr_t index, Object o);
+  inline void init_temp(intptr_t index, Object o);
 
   void PopNAndPush(intptr_t drop_count, Object value) {
     ASSERT(drop_count >= 0);
@@ -567,8 +630,8 @@ class Activation : public HeapObject {
 
   void PrintStack(Heap* heap);
 
-  inline Object* from();
-  inline Object* to();
+  inline Ref* from();
+  inline Ref* to();
 };
 
 class Method : public HeapObject {
@@ -608,10 +671,10 @@ class Method : public HeapObject {
   }
 
   const uint8_t* IP(const SmallInteger bci) {
-    return bytecode()->element_addr(bci->value() - 1);
+    return Hide(bytecode()->element_addr(bci->value() - 1));
   }
   SmallInteger BCI(const uint8_t* ip) {
-    return SmallInteger::New((ip - bytecode()->element_addr(0)) + 1);
+    return SmallInteger::New((Unhide(ip) - bytecode()->element_addr(0)) + 1);
   }
 };
 
@@ -629,22 +692,27 @@ class Closure : public HeapObject {
  public:
   inline SmallInteger num_copied() const;
   inline void set_num_copied(SmallInteger v);
+  inline void init_num_copied(SmallInteger v);
   intptr_t NumCopied() const { return num_copied()->value(); }
 
   inline Activation defining_activation() const;
-  inline void set_defining_activation(Activation a, Barrier barrier = kBarrier);
+  inline void set_defining_activation(Activation a);
+  inline void init_defining_activation(Activation a);
 
   inline SmallInteger initial_bci() const;
   inline void set_initial_bci(SmallInteger bci);
+  inline void init_initial_bci(SmallInteger bci);
 
   inline SmallInteger num_args() const;
   inline void set_num_args(SmallInteger num);
+  inline void init_num_args(SmallInteger num);
 
   inline Object copied(intptr_t index) const;
-  inline void set_copied(intptr_t index, Object o, Barrier barrier = kBarrier);
+  inline void set_copied(intptr_t index, Object o);
+  inline void init_copied(intptr_t index, Object o);
 
-  inline Object* from();
-  inline Object* to();
+  inline Ref* from();
+  inline Ref* to();
 };
 
 class Behavior : public HeapObject {
@@ -688,8 +756,10 @@ class Message : public HeapObject {
   HEAP_OBJECT_IMPLEMENTATION(Message, HeapObject);
 
  public:
-  inline void set_selector(String selector, Barrier barrier = kBarrier);
-  inline void set_arguments(Array arguments, Barrier barrier = kBarrier);
+  inline void set_selector(String selector);
+  inline void init_selector(String selector);
+  inline void set_arguments(Array arguments);
+  inline void init_arguments(Array arguments);
 };
 
 class ObjectStore : public HeapObject {
@@ -728,6 +798,7 @@ class HeapObject::Layout {
  public:
   uword header_;
   uword header_hash_;
+  Link incoming_;
 };
 
 class ForwardingCorpse::Layout : public HeapObject::Layout {
@@ -755,28 +826,28 @@ class LargeInteger::Layout : public HeapObject::Layout {
 
 class RegularObject::Layout : public HeapObject::Layout {
  public:
-  Object slots_[];
+  Ref/*Object*/ slots_[];
 };
 
 class Array::Layout : public HeapObject::Layout {
  public:
   SmallInteger size_;
-  Object elements_[];
+  Ref/*Object*/ elements_[];
 };
 
 class WeakArray::Layout : public HeapObject::Layout {
  public:
   SmallInteger size_;  // Not visited.
-  WeakArray next_;  // Not visited.
-  Object elements_[];
+  //!!!! WeakArray next_;  // Not visited.
+  Ref/*Object*/ elements_[];
 };
 
 class Ephemeron::Layout : public HeapObject::Layout {
  public:
-  Object key_;
-  Object value_;
-  Object finalizer_;
-  Ephemeron next_;  // Not visited.
+  Ref/*Object*/ key_;
+  Ref/*Object*/ value_;
+  Ref/*Object*/ finalizer_;
+  //!!!!  Ephemeron next_;  // Not visited.
 };
 
 class Bytes::Layout : public HeapObject::Layout {
@@ -790,23 +861,23 @@ class ByteArray::Layout : public Bytes::Layout {};
 
 class Method::Layout : public HeapObject::Layout {
  public:
-  SmallInteger header_;
-  Array literals_;
-  ByteArray bytecode_;
-  AbstractMixin mixin_;
-  String selector_;
-  Object source_;
+  Ref/*SmallInteger*/ header_;
+  Ref/*Array*/ literals_;
+  Ref/*ByteArray*/ bytecode_;
+  Ref/*AbstractMixin*/ mixin_;
+  Ref/*String*/ selector_;
+  Ref/*Object*/ source_;
 };
 
 class Activation::Layout : public HeapObject::Layout {
  public:
-  Activation sender_;
-  SmallInteger bci_;
-  Method method_;
-  Closure closure_;
-  Object receiver_;
-  SmallInteger stack_depth_;
-  Object temps_[kMaxTemps];
+  Ref/*Activation*/ sender_;
+  Ref/*SmallInteger*/ bci_;
+  Ref/*Method*/ method_;
+  Ref/*Closure*/ closure_;
+  Ref/*Object*/ receiver_;
+  Ref/*SmallInteger*/ stack_depth_;
+  Ref/*Object*/ temps_[kMaxTemps];
 };
 
 class Float64::Layout : public HeapObject::Layout {
@@ -817,74 +888,74 @@ class Float64::Layout : public HeapObject::Layout {
 class Closure::Layout : public HeapObject::Layout {
  public:
   SmallInteger num_copied_;
-  Activation defining_activation_;
-  SmallInteger initial_bci_;
-  SmallInteger num_args_;
-  Object copied_[];
+  Ref/*Activation*/ defining_activation_;
+  Ref/*SmallInteger*/ initial_bci_;
+  Ref/*SmallInteger*/ num_args_;
+  Ref/*Object*/ copied_[];
 };
 
 class Behavior::Layout : public HeapObject::Layout {
  public:
-  Behavior superclass_;
-  Array methods_;
-  Object enclosing_object_;
-  AbstractMixin mixin_;
-  SmallInteger classid_;
-  SmallInteger format_;
+  Ref/*Behavior*/ superclass_;
+  Ref/*Array*/ methods_;
+  Ref/*Object*/ enclosing_object_;
+  Ref/*AbstractMixin*/ mixin_;
+  Ref/*SmallInteger*/ classid_;
+  Ref/*SmallInteger*/ format_;
 };
 
 class Class::Layout : public Behavior::Layout {
  public:
-  String name_;
-  WeakArray subclasses_;
+  Ref/*String*/ name_;
+  Ref/*WeakArray*/ subclasses_;
 };
 
 class Metaclass::Layout : public Behavior::Layout {
  public:
-  Class this_class_;
+  Ref/*Class*/ this_class_;
 };
 
 class AbstractMixin::Layout : public HeapObject::Layout {
  public:
-  String name_;
-  Array methods_;
-  AbstractMixin enclosing_mixin_;
+  Ref/*String*/ name_;
+  Ref/*Array*/ methods_;
+  Ref/*AbstractMixin*/ enclosing_mixin_;
 };
 
 class Message::Layout : public HeapObject::Layout {
  public:
-  String selector_;
-  Array arguments_;
+  Ref/*String*/ selector_;
+  Ref/*Array*/ arguments_;
 };
 
 class ObjectStore::Layout : public HeapObject::Layout {
  public:
   class SmallInteger array_size_;
-  Object nil_;
-  Object false_;
-  Object true_;
-  Object message_loop_;
-  class Array common_selectors_;
-  class String does_not_understand_;
-  class String non_boolean_receiver_;
-  class String cannot_return_;
-  class String about_to_return_through_;
-  class String unused_bytecode_;
-  class String dispatch_message_;
-  class String dispatch_signal_;
-  Behavior Array_;
-  Behavior ByteArray_;
-  Behavior String_;
-  Behavior Closure_;
-  Behavior Ephemeron_;
-  Behavior Float64_;
-  Behavior LargeInteger_;
-  Behavior MediumInteger_;
-  Behavior Message_;
-  Behavior SmallInteger_;
-  Behavior WeakArray_;
-  Behavior Activation_;
-  Behavior Method_;
+  Ref/*Object*/ nil_;
+  Ref/*Object*/ false_;
+  Ref/*Object*/ true_;
+  Ref/*Object*/ message_loop_;
+  Ref/*class Array*/ common_selectors_;
+  Ref/*class String*/ does_not_understand_;
+  Ref/*class String*/ non_boolean_receiver_;
+  Ref/*class String*/ cannot_return_;
+  Ref/*class String*/ about_to_return_through_;
+  Ref/*class String*/ unused_bytecode_;
+  Ref/*class String*/ dispatch_message_;
+  Ref/*class String*/ dispatch_signal_;
+  Ref/*Behavior*/ Array_;
+  Ref/*Behavior*/ ByteArray_;
+  Ref/*Behavior*/ String_;
+  Ref/*Behavior*/ Closure_;
+  Ref/*Behavior*/ Ephemeron_;
+  Ref/*Behavior*/ Float64_;
+  Ref/*Behavior*/ LargeInteger_;
+  Ref/*Behavior*/ MediumInteger_;
+  Ref/*Behavior*/ Message_;
+  Ref/*Behavior*/ SmallInteger_;
+  Ref/*Behavior*/ WeakArray_;
+  Ref/*Behavior*/ Activation_;
+  Ref/*Behavior*/ Method_;
 };
 
 bool HeapObject::is_marked() const {
@@ -893,11 +964,17 @@ bool HeapObject::is_marked() const {
 void HeapObject::set_is_marked(bool value) {
   ptr()->header_ = MarkBit::update(value, ptr()->header_);
 }
-bool HeapObject::is_remembered() const {
-  return RememberedBit::decode(ptr()->header_);
+bool HeapObject::is_weak_referent() const {
+  return WeakReferentBit::decode(ptr()->header_);
 }
-void HeapObject::set_is_remembered(bool value) {
-  ptr()->header_ = RememberedBit::update(value, ptr()->header_);
+void HeapObject::set_is_weak_referent(bool value) {
+  ptr()->header_ = WeakReferentBit::update(value, ptr()->header_);
+}
+bool HeapObject::in_class_table() const {
+  return InClassTableBit::decode(ptr()->header_);
+}
+void HeapObject::set_in_class_table(bool value) {
+  ptr()->header_ = InClassTableBit::update(value, ptr()->header_);
 }
 bool HeapObject::is_canonical() const {
   return CanonicalBit::decode(ptr()->header_);
@@ -915,10 +992,19 @@ void HeapObject::set_cid(intptr_t value) {
   ptr()->header_ = ClassIdField::update(value, ptr()->header_);
 }
 intptr_t HeapObject::header_hash() const {
-  return ptr()->header_hash_;
+  return HashField::decode(ptr()->header_hash_);
 }
 void HeapObject::set_header_hash(intptr_t value) {
-  ptr()->header_hash_ = value;
+  ptr()->header_hash_ = HashField::update(value, ptr()->header_hash_);
+}
+intptr_t HeapObject::table_index() const {
+  return IndexField::decode(ptr()->header_hash_);
+}
+void HeapObject::set_table_index(intptr_t value) {
+  ptr()->header_hash_ = IndexField::update(value, ptr()->header_hash_);
+}
+Link* HeapObject::incoming() {
+  return &ptr()->incoming_;
 }
 
 HeapObject HeapObject::Initialize(uword addr,
@@ -938,6 +1024,7 @@ HeapObject HeapObject::Initialize(uword addr,
   HeapObject obj = FromAddr(addr);
   obj.ptr()->header_ = header;
   obj.ptr()->header_hash_ = 0;
+  obj.ptr()->incoming_.Init();
   ASSERT(obj.cid() == cid);
   ASSERT(!obj.is_marked());
   return obj;
@@ -999,77 +1086,110 @@ void LargeInteger::set_digit(intptr_t index, digit_t value) {
 }
 
 Object RegularObject::slot(intptr_t index) const {
-  return Load(&ptr()->slots_[index]);
+  return Load<Object>(&ptr()->slots_[index]);
 }
-void RegularObject::set_slot(intptr_t index, Object value,
-                             Barrier barrier) {
-  Store(&ptr()->slots_[index], value, barrier);
+void RegularObject::set_slot(intptr_t index, Object value) {
+  Store<Object>(&ptr()->slots_[index], value);
 }
-Object* RegularObject::from() {
+void RegularObject::init_slot(intptr_t index, Object value) {
+  Init<Object>(&ptr()->slots_[index], value);
+}
+Ref* RegularObject::from() {
   return &ptr()->slots_[0];
 }
-Object* RegularObject::to() {
+Ref* RegularObject::to() {
   intptr_t num_slots =
-      (heap_size() - sizeof(HeapObject::Layout)) >> kWordSizeLog2;
+      (heap_size() - sizeof(HeapObject::Layout)) / sizeof(Ref);
   return &ptr()->slots_[num_slots - 1];
 }
 
-SmallInteger Array::size() const { return Load(&ptr()->size_, kNoBarrier); }
-void Array::set_size(SmallInteger s) { Store(&ptr()->size_, s, kNoBarrier); }
+SmallInteger Array::size() const {
+  //return Load(&ptr()->size_, kNoBarrier);
+  return ptr()->size_;
+}
+void Array::set_size(SmallInteger s) {
+  //Store(&ptr()->size_, s, kNoBarrier);
+  ptr()->size_ = s;
+}
+void Array::init_size(SmallInteger s) {
+  //Store(&ptr()->size_, s, kNoBarrier);
+  ptr()->size_ = s;
+}
 Object Array::element(intptr_t index) const {
-  return Load(&ptr()->elements_[index]);
+  return Load<Object>(&ptr()->elements_[index]);
 }
-void Array::set_element(intptr_t index, Object value, Barrier barrier) {
-  Store(&ptr()->elements_[index], value, barrier);
+void Array::set_element(intptr_t index, Object value) {
+  Store(&ptr()->elements_[index], value);
 }
-Object* Array::from() {
+void Array::init_element(intptr_t index, Object value) {
+  Init(&ptr()->elements_[index], value);
+}
+Ref* Array::from() {
   return &ptr()->elements_[0];
 }
-Object* Array::to() {
+Ref* Array::to() {
   return &ptr()->elements_[Size() - 1];
 }
 
-SmallInteger WeakArray::size() const { return Load(&ptr()->size_, kNoBarrier); }
+SmallInteger WeakArray::size() const {
+  return ptr()->size_;
+}
 void WeakArray::set_size(SmallInteger s) {
-  Store(&ptr()->size_, s, kNoBarrier);
+  ptr()->size_ = s;
 }
-WeakArray WeakArray::next() const { return ptr()->next_; }
-void WeakArray::set_next(WeakArray value) { ptr()->next_ = value; }
+void WeakArray::init_size(SmallInteger s) {
+  ptr()->size_ = s;
+}
 Object WeakArray::element(intptr_t index) const {
-  return Load(&ptr()->elements_[index]);
+  return Load<Object>(&ptr()->elements_[index]);
 }
-void WeakArray::set_element(intptr_t index, Object value, Barrier barrier) {
-  Store(&ptr()->elements_[index], value, barrier);
+void WeakArray::set_element(intptr_t index, Object value) {
+  Store<Object>(&ptr()->elements_[index], value);
 }
-Object* WeakArray::from() {
+void WeakArray::init_element(intptr_t index, Object value) {
+  Init<Object>(&ptr()->elements_[index], value);
+}
+Ref* WeakArray::from() {
   return &ptr()->elements_[0];
 }
-Object* WeakArray::to() {
+Ref* WeakArray::to() {
   return &ptr()->elements_[Size() - 1];
 }
 
-Object Ephemeron::key() const { return ptr()->key_; }
-Object* Ephemeron::key_ptr() { return &ptr()->key_; }
-void Ephemeron::set_key(Object key, Barrier barrier) {
-  Store(&ptr()->key_, key, barrier);
+Object Ephemeron::key() const { return Load<Object>(&ptr()->key_); }
+void Ephemeron::set_key(Object key) {
+  Store<Object>(&ptr()->key_, key);
 }
-Object Ephemeron::value() const { return Load(&ptr()->value_); }
-Object* Ephemeron::value_ptr() { return &ptr()->value_; }
-void Ephemeron::set_value(Object value, Barrier barrier) {
-  Store(&ptr()->value_, value, barrier);
+void Ephemeron::init_key(Object key) {
+  Init<Object>(&ptr()->key_, key);
 }
-Object Ephemeron::finalizer() const { return Load(&ptr()->finalizer_); }
-Object* Ephemeron::finalizer_ptr() { return &ptr()->finalizer_; }
-void Ephemeron::set_finalizer(Object finalizer, Barrier barrier) {
-  Store(&ptr()->finalizer_, finalizer, barrier);
+Object Ephemeron::value() const { return Load<Object>(&ptr()->value_); }
+void Ephemeron::set_value(Object value) {
+  Store<Object>(&ptr()->value_, value);
 }
-Ephemeron Ephemeron::next() const { return ptr()->next_; }
-void Ephemeron::set_next(Ephemeron value) { ptr()->next_ = value; }
-Object* Ephemeron::from() { return &ptr()->key_; }
-Object* Ephemeron::to() { return &ptr()->finalizer_; }
+void Ephemeron::init_value(Object value) {
+  Init<Object>(&ptr()->value_, value);
+}
+Object Ephemeron::finalizer() const { return Load<Object>(&ptr()->finalizer_); }
+void Ephemeron::set_finalizer(Object finalizer) {
+  Store<Object>(&ptr()->finalizer_, finalizer);
+}
+void Ephemeron::init_finalizer(Object finalizer) {
+  Init<Object>(&ptr()->finalizer_, finalizer);
+}
+Ref* Ephemeron::from() { return &ptr()->key_; }
+Ref* Ephemeron::to() { return &ptr()->finalizer_; }
 
-SmallInteger Bytes::size() const { return Load(&ptr()->size_, kNoBarrier); }
-void Bytes::set_size(SmallInteger s) { Store(&ptr()->size_, s, kNoBarrier); }
+SmallInteger Bytes::size() const {
+  return ptr()->size_;
+}
+
+void Bytes::set_size(SmallInteger s) {
+  ptr()->size_ = s;
+}
+void Bytes::init_size(SmallInteger s) {
+  ptr()->size_ = s;
+}
 uint8_t Bytes::element(intptr_t index) const {
   return *element_addr(index);
 }
@@ -1087,164 +1207,291 @@ const uint8_t* Bytes::element_addr(intptr_t index) const {
   return &elements[index];
 }
 
-SmallInteger Method::header() const { return Load(&ptr()->header_); }
-Array Method::literals() const { return Load(&ptr()->literals_); }
-ByteArray Method::bytecode() const { return Load(&ptr()->bytecode_); }
-AbstractMixin Method::mixin() const { return Load(&ptr()->mixin_); }
-String Method::selector() const { return Load(&ptr()->selector_); }
-Object Method::source() const { return Load(&ptr()->source_); }
+SmallInteger Method::header() const { return Load<SmallInteger>(&ptr()->header_); }
+Array Method::literals() const { return Load<Array>(&ptr()->literals_); }
+ByteArray Method::bytecode() const { return Load<ByteArray>(&ptr()->bytecode_); }
+AbstractMixin Method::mixin() const { return Load<AbstractMixin>(&ptr()->mixin_); }
+String Method::selector() const { return Load<String>(&ptr()->selector_); }
+Object Method::source() const { return Load<Object>(&ptr()->source_); }
 
-Activation Activation::sender() const { return Load(&ptr()->sender_); }
-void Activation::set_sender(Activation s, Barrier barrier) {
-  Store(&ptr()->sender_, s, barrier);
+Activation Activation::sender() const { return Load<Activation>(&ptr()->sender_); }
+void Activation::set_sender(Activation s) {
+  Store<Activation>(&ptr()->sender_, s);
 }
-SmallInteger Activation::bci() const { return Load(&ptr()->bci_, kNoBarrier); }
-void Activation::set_bci(SmallInteger i) { Store(&ptr()->bci_, i, kNoBarrier); }
-Method Activation::method() const { return Load(&ptr()->method_); }
-void Activation::set_method(Method m, Barrier barrier) {
-  Store(&ptr()->method_, m, barrier);
+void Activation::init_sender(Activation s) {
+  Init<Activation>(&ptr()->sender_, s);
 }
-Closure Activation::closure() const { return Load(&ptr()->closure_); }
-void Activation::set_closure(Closure m, Barrier barrier) {
-  Store(&ptr()->closure_, m, barrier);
+SmallInteger Activation::bci() const {
+  return Load<SmallInteger>(&ptr()->bci_);
 }
-Object Activation::receiver() const { return Load(&ptr()->receiver_); }
-void Activation::set_receiver(Object o, Barrier barrier) {
-  Store(&ptr()->receiver_, o, barrier);
+void Activation::set_bci(SmallInteger i) {
+  Store<SmallInteger>(&ptr()->bci_, i);
+}
+void Activation::init_bci(SmallInteger i) {
+  Init<SmallInteger>(&ptr()->bci_, i);
+}
+Method Activation::method() const {
+  return Load<Method>(&ptr()->method_);
+}
+void Activation::set_method(Method m) {
+  Store<Method>(&ptr()->method_, m);
+}
+void Activation::init_method(Method m) {
+  Init<Method>(&ptr()->method_, m);
+}
+Closure Activation::closure() const {
+  return Load<Closure>(&ptr()->closure_);
+}
+void Activation::set_closure(Closure m) {
+  Store<Closure>(&ptr()->closure_, m);
+}
+void Activation::init_closure(Closure m) {
+  Init<Closure>(&ptr()->closure_, m);
+}
+Object Activation::receiver() const {
+  return Load<Object>(&ptr()->receiver_);
+}
+void Activation::set_receiver(Object o) {
+  Store<Object>(&ptr()->receiver_, o);
+}
+void Activation::init_receiver(Object o) {
+  Init<Object>(&ptr()->receiver_, o);
 }
 SmallInteger Activation::stack_depth() const {
-  return Load(&ptr()->stack_depth_, kNoBarrier);
+  return Load<SmallInteger>(&ptr()->stack_depth_);
 }
 void Activation::set_stack_depth(SmallInteger d) {
-  Store(&ptr()->stack_depth_, d, kNoBarrier);
+  Store<SmallInteger>(&ptr()->stack_depth_, d);
+}
+void Activation::init_stack_depth(SmallInteger d) {
+  Init<SmallInteger>(&ptr()->stack_depth_, d);
 }
 Object Activation::temp(intptr_t index) const {
-  return Load(&ptr()->temps_[index]);
+  return Load<Object>(&ptr()->temps_[index]);
 }
-void Activation::set_temp(intptr_t index, Object o, Barrier barrier) {
-  Store(&ptr()->temps_[index], o, barrier);
+void Activation::set_temp(intptr_t index, Object o) {
+  Store<Object>(&ptr()->temps_[index], o);
 }
-Object* Activation::from() {
-  return reinterpret_cast<Object*>(&ptr()->sender_);
+void Activation::init_temp(intptr_t index, Object o) {
+  Init<Object>(&ptr()->temps_[index], o);
 }
-Object* Activation::to() {
-  return reinterpret_cast<Object*>(&ptr()->stack_depth_) + StackDepth();
+Ref* Activation::from() {
+  return &ptr()->sender_;
+}
+Ref* Activation::to() {
+  //  return &ptr()->stack_depth_ + StackDepth();
+  return &ptr()->temps_[kMaxTemps - 1];
 }
 
 double Float64::value() const { return ptr()->value_; }
 void Float64::set_value(double v) { ptr()->value_ = v; }
 
 SmallInteger Closure::num_copied() const {
-  return Load(&ptr()->num_copied_, kNoBarrier);
+  //return Load(&ptr()->num_copied_, kNoBarrier);
+  return ptr()->num_copied_;
 }
 void Closure::set_num_copied(SmallInteger v) {
-  Store(&ptr()->num_copied_, v, kNoBarrier);
+  //Store(&ptr()->num_copied_, v, kNoBarrier);
+  ptr()->num_copied_ = v;
+}
+void Closure::init_num_copied(SmallInteger v) {
+  //Store(&ptr()->num_copied_, v, kNoBarrier);
+  ptr()->num_copied_ = v;
 }
 Activation Closure::defining_activation() const {
-  return Load(&ptr()->defining_activation_);
+  return Load<Activation>(&ptr()->defining_activation_);
 }
-void Closure::set_defining_activation(Activation a, Barrier barrier) {
-  Store(&ptr()->defining_activation_, a, barrier);
+void Closure::set_defining_activation(Activation a) {
+  Store<Activation>(&ptr()->defining_activation_, a);
+}
+void Closure::init_defining_activation(Activation a) {
+  Init<Activation>(&ptr()->defining_activation_, a);
 }
 SmallInteger Closure::initial_bci() const {
-  return Load(&ptr()->initial_bci_, kNoBarrier);
+  return Load<SmallInteger>(&ptr()->initial_bci_);
 }
 void Closure::set_initial_bci(SmallInteger bci) {
-  Store(&ptr()->initial_bci_, bci, kNoBarrier);
+  Store<SmallInteger>(&ptr()->initial_bci_, bci);
+}
+void Closure::init_initial_bci(SmallInteger bci) {
+  Init<SmallInteger>(&ptr()->initial_bci_, bci);
 }
 SmallInteger Closure::num_args() const {
-  return Load(&ptr()->num_args_, kNoBarrier);
+  return Load<SmallInteger>(&ptr()->num_args_);
 }
 void Closure::set_num_args(SmallInteger num) {
-  Store(&ptr()->num_args_, num, kNoBarrier);
+  Store<SmallInteger>(&ptr()->num_args_, num);
+}
+void Closure::init_num_args(SmallInteger num) {
+  Init<SmallInteger>(&ptr()->num_args_, num);
 }
 Object Closure::copied(intptr_t index) const {
-  return Load(&ptr()->copied_[index]);
+  return Load<Object>(&ptr()->copied_[index]);
 }
-void Closure::set_copied(intptr_t index, Object o, Barrier barrier ) {
-  Store(&ptr()->copied_[index], o, barrier);
+void Closure::set_copied(intptr_t index, Object o) {
+  Store<Object>(&ptr()->copied_[index], o);
 }
-Object* Closure::from() {
-  return reinterpret_cast<Object*>(&ptr()->num_copied_);
+void Closure::init_copied(intptr_t index, Object o) {
+  Init<Object>(&ptr()->copied_[index], o);
 }
-Object* Closure::to() {
-  return reinterpret_cast<Object*>(&ptr()->copied_[NumCopied() - 1]);
+Ref* Closure::from() {
+  //return (&ptr()->num_copied_);
+  return (&ptr()->defining_activation_);
+}
+Ref* Closure::to() {
+  return (&ptr()->copied_[NumCopied() - 1]);
 }
 
-Behavior Behavior::superclass() const { return Load(&ptr()->superclass_); }
-Array Behavior::methods() const { return Load(&ptr()->methods_); }
-AbstractMixin Behavior::mixin() const { return Load(&ptr()->mixin_); }
-Object Behavior::enclosing_object() const {
-  return Load(&ptr()->enclosing_object_);
+Behavior Behavior::superclass() const {
+  return Load<Behavior>(&ptr()->superclass_);
 }
-SmallInteger Behavior::id() const { return Load(&ptr()->classid_, kNoBarrier); }
+Array Behavior::methods() const {
+  return Load<Array>(&ptr()->methods_);
+}
+AbstractMixin Behavior::mixin() const {
+  return Load<AbstractMixin>(&ptr()->mixin_);
+}
+Object Behavior::enclosing_object() const {
+  return Load<Object>(&ptr()->enclosing_object_);
+}
+SmallInteger Behavior::id() const {
+  return Load<SmallInteger>(&ptr()->classid_);
+}
 void Behavior::set_id(SmallInteger id) {
-  Store(&ptr()->classid_, id, kNoBarrier);
+  Store<SmallInteger>(&ptr()->classid_, id);
 }
 SmallInteger Behavior::format() const {
-  return Load(&ptr()->format_, kNoBarrier);
+  return Load<SmallInteger>(&ptr()->format_);
 }
 
-String Class::name() const { return Load(&ptr()->name_); }
-WeakArray Class::subclasses() const { return Load(&ptr()->subclasses_); }
+String Class::name() const {
+  return Load<String>(&ptr()->name_);
+}
+WeakArray Class::subclasses() const {
+  return Load<WeakArray>(&ptr()->subclasses_);
+}
 
-Class Metaclass::this_class() const { return Load(&ptr()->this_class_); }
+Class Metaclass::this_class() const {
+  return Load<Class>(&ptr()->this_class_);
+}
 
-String AbstractMixin::name() const { return Load(&ptr()->name_); }
-Array AbstractMixin::methods() const { return Load(&ptr()->methods_); }
+String AbstractMixin::name() const { return Load<String>(&ptr()->name_); }
+Array AbstractMixin::methods() const { return Load<Array>(&ptr()->methods_); }
 AbstractMixin AbstractMixin::enclosing_mixin() const {
-  return Load(&ptr()->enclosing_mixin_);
+  return Load<AbstractMixin>(&ptr()->enclosing_mixin_);
 }
 
-void Message::set_selector(String selector, Barrier barrier) {
-  Store(&ptr()->selector_, selector, barrier);
+void Message::set_selector(String selector) {
+  Store<String>(&ptr()->selector_, selector);
 }
-void Message::set_arguments(Array arguments, Barrier barrier) {
-  Store(&ptr()->arguments_, arguments, barrier);
+void Message::init_selector(String selector) {
+  Init<String>(&ptr()->selector_, selector);
+}
+void Message::set_arguments(Array arguments) {
+  Store<Array>(&ptr()->arguments_, arguments);
+}
+void Message::init_arguments(Array arguments) {
+  Init<Array>(&ptr()->arguments_, arguments);
 }
 
-class SmallInteger ObjectStore::size() const { return ptr()->array_size_; }
-Object ObjectStore::nil_obj() const { return ptr()->nil_; }
-Object ObjectStore::false_obj() const { return ptr()->false_; }
-Object ObjectStore::true_obj() const { return ptr()->true_; }
-Object ObjectStore::message_loop() const { return ptr()->message_loop_; }
+class SmallInteger ObjectStore::size() const {
+  //return Load<SmallInteger>(&ptr()->array_size_);
+  return ptr()->array_size_;
+}
+Object ObjectStore::nil_obj() const {
+  return Load<Object>(&ptr()->nil_);
+}
+Object ObjectStore::false_obj() const {
+  return Load<Object>(&ptr()->false_);
+}
+Object ObjectStore::true_obj() const {
+  return Load<Object>(&ptr()->true_);
+}
+Object ObjectStore::message_loop() const {
+  return Load<Object>(&ptr()->message_loop_);
+}
 class Array ObjectStore::common_selectors() const {
-  return ptr()->common_selectors_;
+  return Load<class Array>(&ptr()->common_selectors_);
 }
 class String ObjectStore::does_not_understand() const {
-  return ptr()->does_not_understand_;
+  return Load<class String>(&ptr()->does_not_understand_);
 }
 class String ObjectStore::non_boolean_receiver() const {
-  return ptr()->non_boolean_receiver_;
+  return Load<class String>(&ptr()->non_boolean_receiver_);
 }
 class String ObjectStore::cannot_return() const {
-  return ptr()->cannot_return_;
+  return Load<class String>(&ptr()->cannot_return_);
 }
 class String ObjectStore::about_to_return_through() const {
-  return ptr()->about_to_return_through_;
+  return Load<class String>(&ptr()->about_to_return_through_);
 }
 class String ObjectStore::unused_bytecode() const {
-  return ptr()->unused_bytecode_;
+  return Load<class String>(&ptr()->unused_bytecode_);
 }
 class String ObjectStore::dispatch_message() const {
-  return ptr()->dispatch_message_;
+  return Load<class String>(&ptr()->dispatch_message_);
 }
 class String ObjectStore::dispatch_signal() const {
-  return ptr()->dispatch_signal_;
+  return Load<class String>(&ptr()->dispatch_signal_);
 }
-Behavior ObjectStore::Array() const { return ptr()->Array_; }
-Behavior ObjectStore::ByteArray() const { return ptr()->ByteArray_; }
-Behavior ObjectStore::String() const { return ptr()->String_; }
-Behavior ObjectStore::Closure() const { return ptr()->Closure_; }
-Behavior ObjectStore::Ephemeron() const { return ptr()->Ephemeron_; }
-Behavior ObjectStore::Float64() const { return ptr()->Float64_; }
-Behavior ObjectStore::LargeInteger() const { return ptr()->LargeInteger_; }
-Behavior ObjectStore::MediumInteger() const { return ptr()->MediumInteger_; }
-Behavior ObjectStore::Message() const { return ptr()->Message_; }
-Behavior ObjectStore::SmallInteger() const { return ptr()->SmallInteger_; }
-Behavior ObjectStore::WeakArray() const { return ptr()->WeakArray_; }
-Behavior ObjectStore::Activation() const { return ptr()->Activation_; }
-Behavior ObjectStore::Method() const { return ptr()->Method_; }
+Behavior ObjectStore::Array() const { return Load<Behavior>(&ptr()->Array_); }
+Behavior ObjectStore::ByteArray() const { return Load<Behavior>(&ptr()->ByteArray_); }
+Behavior ObjectStore::String() const { return Load<Behavior>(&ptr()->String_); }
+Behavior ObjectStore::Closure() const { return Load<Behavior>(&ptr()->Closure_); }
+Behavior ObjectStore::Ephemeron() const { return Load<Behavior>(&ptr()->Ephemeron_); }
+Behavior ObjectStore::Float64() const { return Load<Behavior>(&ptr()->Float64_); }
+Behavior ObjectStore::LargeInteger() const { return Load<Behavior>(&ptr()->LargeInteger_); }
+Behavior ObjectStore::MediumInteger() const { return Load<Behavior>(&ptr()->MediumInteger_); }
+Behavior ObjectStore::Message() const { return Load<Behavior>(&ptr()->Message_); }
+Behavior ObjectStore::SmallInteger() const { return Load<Behavior>(&ptr()->SmallInteger_); }
+Behavior ObjectStore::WeakArray() const { return Load<Behavior>(&ptr()->WeakArray_); }
+Behavior ObjectStore::Activation() const { return Load<Behavior>(&ptr()->Activation_); }
+Behavior ObjectStore::Method() const { return Load<Behavior>(&ptr()->Method_); }
+
+
+void Ref::Init(Object source, Object target) {
+#if defined(DEBUG)
+  Link::Init();
+#endif
+  from = source;
+  to = target;
+  if (target->IsHeapObject()) {
+    static_cast<HeapObject>(target)->incoming()->Insert(this);
+    ASSERT(next != this);
+    ASSERT(prev != this);
+    ASSERT(next != nullptr);
+    ASSERT(prev != nullptr);
+  } else {
+    ASSERT(next == this);
+    ASSERT(prev == this);
+  }
+}
+
+void Ref::Update(Object source, Object new_target) {
+  ASSERT(from == source);
+  ASSERT(source == nullptr || source->IsHeapObject());
+  UpdateNoCheck(new_target);
+}
+
+void Ref::UpdateNoCheck(Object new_target) {
+  if (to->IsHeapObject()) {
+    Remove();
+  } else {
+    ASSERT(next == this);
+    ASSERT(prev == this);
+  }
+  to = new_target;
+  if (new_target->IsHeapObject()) {
+    static_cast<HeapObject>(new_target)->incoming()->Insert(this);
+    ASSERT(next != this);
+    ASSERT(prev != this);
+    ASSERT(next != nullptr);
+    ASSERT(prev != nullptr);
+  } else {
+    ASSERT(next == this);
+    ASSERT(prev == this);
+  }
+}
 
 }  // namespace psoup
 

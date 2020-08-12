@@ -43,17 +43,17 @@ intptr_t HeapObject::HeapSizeFromClass() const {
                           sizeof(uint8_t) * String::Cast(*this)->Size());
   case kArrayCid:
     return AllocationSize(sizeof(Array::Layout) +
-                          sizeof(Object) * Array::Cast(*this)->Size());
+                          sizeof(Ref) * Array::Cast(*this)->Size());
   case kWeakArrayCid:
     return AllocationSize(sizeof(WeakArray::Layout) +
-                          sizeof(Object) * WeakArray::Cast(*this)->Size());
+                          sizeof(Ref) * WeakArray::Cast(*this)->Size());
   case kEphemeronCid:
     return AllocationSize(sizeof(Ephemeron::Layout));
   case kActivationCid:
     return AllocationSize(sizeof(Activation::Layout));
   case kClosureCid:
     return AllocationSize(sizeof(Closure::Layout) +
-                          sizeof(Object) * Closure::Cast(*this)->NumCopied());
+                          sizeof(Ref) * Closure::Cast(*this)->NumCopied());
   default:
     UNREACHABLE();
     // Need to get num slots from class.
@@ -62,7 +62,7 @@ intptr_t HeapObject::HeapSizeFromClass() const {
 }
 
 
-void HeapObject::Pointers(Object** from, Object** to) {
+void HeapObject::Pointers(Ref** from, Ref** to) {
   ASSERT(IsHeapObject());
 
   switch (cid()) {
@@ -77,8 +77,8 @@ void HeapObject::Pointers(Object** from, Object** to) {
   case kByteArrayCid:
   case kStringCid:
     // No pointers (or only smis for size/hash)
-    *from = reinterpret_cast<Object*>(1);
-    *to = reinterpret_cast<Object*>(0);
+    *from = reinterpret_cast<Ref*>(1);
+    *to = reinterpret_cast<Ref*>(0);
     return;
   case kArrayCid:
     *from = Array::Cast(*this)->from();
@@ -106,14 +106,6 @@ void HeapObject::Pointers(Object** from, Object** to) {
     return;
   }
 }
-
-
-void HeapObject::AddToRememberedSet() const {
-  Isolate* isolate = Isolate::Current();
-  ASSERT(isolate != NULL);
-  isolate->heap()->AddToRememberedSet(*this);
-}
-
 
 char* Object::ToCString(Heap* heap) const {
   switch (ClassId()) {
@@ -258,7 +250,7 @@ SmallInteger String::EnsureHash(Isolate* isolate) {
       h = h * kFNVPrime;
     }
     h = h ^ isolate->salt();
-    h = h & SmallInteger::kMaxValue;
+    h = h & 0x7FFFFFFF;
     if (h == 0) {
       h = 1;
     }

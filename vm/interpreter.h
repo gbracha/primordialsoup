@@ -18,6 +18,7 @@ namespace psoup {
 class Heap;
 class Isolate;
 class Object;
+class Ref;
 
 class Interpreter {
  public:
@@ -35,7 +36,7 @@ class Interpreter {
   Method MethodAt(Behavior cls, String selector);
   void ActivateClosure(intptr_t num_args);
 
-  void Interrupt() { checked_stack_limit_ = reinterpret_cast<Object*>(-1); }
+  void Interrupt() { checked_stack_limit_ = reinterpret_cast<Ref*>(-1); }
   void PrintStack();
 
   const uint8_t* IPForAssert() { return ip_; }
@@ -55,38 +56,40 @@ class Interpreter {
   intptr_t ActivationTempSize(Activation activation);
   void ActivationTempSizePut(Activation activation, intptr_t new_size);
 
-  void GCPrologue();
-  void RootPointers(Object** from, Object** to) {
+  void RootPointers(Ref** from, Ref** to) {
     *from = &nil_;
-    *to = reinterpret_cast<Object*>(&object_store_);
+    *to = /*reinterpret_cast<Object*>*/(&object_store_);
   }
-  void StackPointers(Object** from, Object** to) {
+  void StackPointers(Ref** from, Ref** to) {
     *from = sp_;
     *to = stack_base_ - 1;
   }
-  void GCEpilogue();
+  void ClearCache();
 
   void Push(Object value) {
     ASSERT(sp_ <= stack_base_);
     ASSERT(sp_ > stack_limit_);
-    *--sp_ = value;
+    --sp_;
+    sp_->Update(nullptr, value);
   }
   Object Pop() {
     ASSERT(StackDepth() > 0);
-    return *sp_++;
+    Object result = sp_->to;
+    sp_++;
+    return result;
   }
   void PopNAndPush(intptr_t n, Object value) {
     ASSERT(StackDepth() >= n);
     sp_ += (n - 1);
-    *sp_ = value;
+    sp_->Update(nullptr, value);
   }
   Object Stack(intptr_t depth) {
     ASSERT((fp_ == 0) || (StackDepth() >= depth));
-    return sp_[depth];
+    return sp_[depth].to;
   }
   void StackPut(intptr_t depth, Object value) {
     ASSERT(StackDepth() >= depth);
-    sp_[depth] = value;
+    sp_[depth].Update(nullptr, value);
   }
   void Grow(intptr_t elements) { sp_ -= elements; }
   void Drop(intptr_t elements) {
@@ -95,19 +98,19 @@ class Interpreter {
   }
   intptr_t StackDepth() { return &fp_[-4] - sp_; }  // Magic!
 
-  ObjectStore object_store() const { return object_store_; }
-  Object nil_obj() const { return nil_; }
-  Object false_obj() const { return false_; }
-  Object true_obj() const { return true_; }
+  ObjectStore object_store() { return ObjectStore(object_store_.to); }
+  Object nil_obj() { return nil_.to; }
+  Object false_obj() { return false_.to; }
+  Object true_obj() { return true_.to; }
   void InitializeRoot(ObjectStore object_store) {
-    ASSERT(object_store_ == nullptr);
+    ASSERT(object_store_.to == nullptr);
     ASSERT(object_store->IsArray());
-    nil_ = object_store->nil_obj();
-    false_ = object_store->false_obj();
-    true_ = object_store->true_obj();
-    object_store_ = object_store;
+    nil_.Init(NULL, object_store->nil_obj());
+    false_.Init(NULL, object_store->false_obj());
+    true_.Init(NULL, object_store->true_obj());
+    object_store_.Init(NULL, object_store);
     // Becomes the sender of the dispatch activation.
-    ip_ = reinterpret_cast<const uint8_t*>(static_cast<uword>(nil_));
+    ip_ = reinterpret_cast<const uint8_t*>(static_cast<uword>(nil_.to));
   }
 
  private:
@@ -180,24 +183,30 @@ class Interpreter {
   NOINLINE void NonLocalReturn(Object result);
 
   NOINLINE void CreateBaseFrame(Activation activation);
-  NOINLINE Activation EnsureActivation(Object* fp);
+  NOINLINE Activation EnsureActivation(Ref* fp);
   NOINLINE Activation FlushAllFrames();
   bool HasLivingFrame(Activation activation);
 
   static constexpr intptr_t kStackSlots = 1024;
-  static constexpr intptr_t kStackSize = kStackSlots * sizeof(Object);
+  static constexpr intptr_t kStackSize = kStackSlots * sizeof(Ref);
 
+  INLINE uint8_t Fetch() {
+    const uint8_t* ip = Unhide(ip_);
+    uint8_t byte = *ip++;
+    ip_ = Hide(ip);
+    return byte;
+  }
   const uint8_t* ip_;
-  Object* sp_;
-  Object* fp_;
-  Object* stack_base_;
-  Object* stack_limit_;
-  Object* volatile checked_stack_limit_;
+  Ref* sp_;
+  Ref* fp_;
+  Ref* stack_base_;
+  Ref* stack_limit_;
+  Ref* volatile checked_stack_limit_;
 
-  Object nil_;
-  Object false_;
-  Object true_;
-  ObjectStore object_store_;
+  Ref/*Object*/ nil_;
+  Ref/*Object*/ false_;
+  Ref/*Object*/ true_;
+  Ref/*ObjectStore*/ object_store_;
 
   Heap* const heap_;
   Isolate* const isolate_;

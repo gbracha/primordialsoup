@@ -11,7 +11,7 @@
 #include "vm/primitives.h"
 
 #define H heap_
-#define nil nil_
+#define nil (nil_.to)
 
 namespace psoup {
 
@@ -54,61 +54,61 @@ static SmallInteger MakeFlags(intptr_t num_args, bool is_closure) {
   return SmallInteger::New((num_args << 1) | (is_closure ? 1 : 0));
 }
 
-static const uint8_t* FrameSavedIP(Object* fp) {
-  return reinterpret_cast<const uint8_t*>(static_cast<uword>(fp[1]));
+static const uint8_t* FrameSavedIP(Ref* fp) {
+  return reinterpret_cast<const uint8_t*>(static_cast<uword>(fp[1].to));
 }
-static const uint8_t** FrameSavedIPSlot(Object* fp) {
-  return reinterpret_cast<const uint8_t**>((uword)&fp[1]);
-}
+/*static const uint8_t** FrameSavedIPSlot(Ref* fp) {
+  return reinterpret_cast<const uint8_t**>((uword)&fp[1].to);
+}*/
 
-static Object* FrameSavedFP(Object* fp) {
-  return reinterpret_cast<Object*>(static_cast<uword>(fp[0]));
-}
-
-static SmallInteger FrameFlags(Object* fp) {
-  return static_cast<SmallInteger>(fp[-1]);
+static Ref* FrameSavedFP(Ref* fp) {
+  return reinterpret_cast<Ref*>(static_cast<uword>(fp[0].to));
 }
 
-static Method FrameMethod(Object* fp) { return static_cast<Method>(fp[-2]); }
-
-static Activation FrameActivation(Object* fp) {
-  return static_cast<Activation>(fp[-3]);
-}
-static void FrameActivationPut(Object* fp, Activation activation) {
-  fp[-3] = activation;
+static SmallInteger FrameFlags(Ref* fp) {
+  return static_cast<SmallInteger>(fp[-1].to);
 }
 
-static Object FrameReceiver(Object* fp) { return fp[-4]; }
+static Method FrameMethod(Ref* fp) { return static_cast<Method>(fp[-2].to); }
 
-static Object FrameTemp(Object* fp, intptr_t index) {
+static Activation FrameActivation(Ref* fp) {
+  return static_cast<Activation>(fp[-3].to);
+}
+static void FrameActivationPut(Ref* fp, Activation activation) {
+  fp[-3].Update(nullptr, activation);
+}
+
+static Object FrameReceiver(Ref* fp) { return fp[-4].to; }
+
+static Object FrameTemp(Ref* fp, intptr_t index) {
   intptr_t num_args = FlagsNumArgs(FrameFlags(fp));
   if (index < num_args) {
-    return fp[1 + num_args - index];
+    return fp[1 + num_args - index].to;
   } else {
-    return fp[-5 - (index - num_args)];
+    return fp[-5 - (index - num_args)].to;
   }
 }
-static void FrameTempPut(Object* fp, intptr_t index, Object value) {
+static void FrameTempPut(Ref* fp, intptr_t index, Object value) {
   intptr_t num_args = FlagsNumArgs(FrameFlags(fp));
   if (index < num_args) {
     FATAL("Assignment to parameter");
   } else {
-    fp[-5 - (index - num_args)] = value;
+    fp[-5 - (index - num_args)].Update(nullptr, value);
   }
 }
 
-static Object* FrameSavedSP(Object* fp) {
+static Ref* FrameSavedSP(Ref* fp) {
   intptr_t num_args = FlagsNumArgs(FrameFlags(fp));
   return fp + 3 + num_args;
 }
 
-static intptr_t FrameNumLocals(Object* fp, Object* sp) {
+static intptr_t FrameNumLocals(Ref* fp, Ref* sp) {
   return &fp[-4] - sp;
 }
 
-static Activation FrameBaseSender(Object* fp) {
+static Activation FrameBaseSender(Ref* fp) {
   ASSERT(FrameSavedFP(fp) == 0);
-  return static_cast<Activation>(fp[1]);
+  return static_cast<Activation>(reinterpret_cast<uword>(FrameSavedIP(fp)));
 }
 
 Interpreter::Interpreter(Heap* heap, Isolate* isolate) :
@@ -117,26 +117,26 @@ Interpreter::Interpreter(Heap* heap, Isolate* isolate) :
     fp_(nullptr),
     stack_base_(nullptr),
     stack_limit_(nullptr),
-    nil_(nullptr),
+    /*nil_(nullptr),
     false_(nullptr),
     true_(nullptr),
-    object_store_(nullptr),
+    object_store_(nullptr),*/
     heap_(heap),
     isolate_(isolate),
     environment_(nullptr) {
   heap->InitializeInterpreter(this);
 
-  stack_limit_ = reinterpret_cast<Object*>(malloc(kStackSize));
+  stack_limit_ = reinterpret_cast<Ref*>(malloc(kStackSize));
   stack_base_ = stack_limit_ + kStackSlots;
   sp_ = stack_base_;
   checked_stack_limit_ =
       stack_limit_ + (sizeof(Activation::Layout) / sizeof(Object));
 
-#if defined(DEBUG)
+  //#if defined(DEBUG)
   for (intptr_t i = 0; i < kStackSlots; i++) {
-    stack_limit_[i] = static_cast<Object>(kUninitializedWord);
+    stack_limit_[i].Init(NULL, 0);// = static_cast<Object>(kUninitializedWord);
   }
-#endif
+  //#endif
 }
 
 
@@ -233,7 +233,7 @@ void Interpreter::PushNewArrayWithElements(intptr_t size) {
   Array result = H->AllocateArray(size);  // SAFEPOINT
   for (intptr_t i = 0; i < size; i++) {
     Object e = Stack(size - i - 1);
-    result->set_element(i, e);
+    result->init_element(i, e);
   }
   PopNAndPush(size, result);
 }
@@ -242,7 +242,7 @@ void Interpreter::PushNewArrayWithElements(intptr_t size) {
 void Interpreter::PushNewArray(intptr_t size) {
   Array result = H->AllocateArray(size);  // SAFEPOINT
   for (intptr_t i = 0; i < size; i++) {
-    result->set_element(i, nil, kNoBarrier);
+    result->init_element(i, nil);
   }
   Push(result);
 }
@@ -254,15 +254,15 @@ void Interpreter::PushClosure(intptr_t num_copied,
   EnsureActivation(fp_);  // SAFEPOINT
 
   Closure result = H->AllocateClosure(num_copied);  // SAFEPOINT
-  result->set_defining_activation(FrameActivation(fp_));
-  result->set_initial_bci(FrameMethod(fp_)->BCI(ip_));
-  result->set_num_args(SmallInteger::New(num_args));
+  result->init_defining_activation(FrameActivation(fp_));
+  result->init_initial_bci(FrameMethod(fp_)->BCI(ip_));
+  result->init_num_args(SmallInteger::New(num_args));
   for (intptr_t i = 0; i < num_copied; i++) {
     Object e = Stack(num_copied - i - 1);
-    result->set_copied(i, e);
+    result->init_copied(i, e);
   }
 
-  ip_ += block_size;
+  ip_ += (block_size * 2);
   PopNAndPush(num_copied, result);
 }
 
@@ -634,7 +634,7 @@ void Interpreter::DNUSend(String selector,
   }
   for (intptr_t i = 0; i < num_args; i++) {
     Object e = Stack(num_args - i - 1);
-    arguments->set_element(i, e);
+    arguments->init_element(i, e);
   }
   Message message;
   {
@@ -645,8 +645,8 @@ void Interpreter::DNUSend(String selector,
     message = H->AllocateMessage();  // SAFEPOINT
   }
 
-  message->set_selector(selector);
-  message->set_arguments(arguments);
+  message->init_selector(selector);
+  message->init_arguments(arguments);
 
   Drop(num_args);
   if (!present_receiver) {
@@ -895,7 +895,7 @@ void Interpreter::CreateBaseFrame(Activation activation) {
   ASSERT(!activation->sender()->IsSmallInteger());
 
   // Create frame.
-  Push(activation->sender());           // Base sender.
+  Push(Object(static_cast<uword>(activation->sender())));  // Base sender.
   Push(Object(static_cast<uword>(0)));  // Saved FP.
   fp_ = sp_;
   Push(MakeFlags(num_args, is_closure));
@@ -923,7 +923,7 @@ void Interpreter::CreateBaseFrame(Activation activation) {
 
 
 void Interpreter::StackOverflow() {
-  if (checked_stack_limit_ == reinterpret_cast<Object*>(-1)) {
+  if (checked_stack_limit_ == reinterpret_cast<Ref*>(-1)) {
     // Interrupt.
     isolate_->PrintStack();
     Exit();
@@ -946,7 +946,7 @@ String Interpreter::SelectorAt(intptr_t index) {
 
 
 void Interpreter::LocalReturn(Object result) {
-  Object* saved_fp = FrameSavedFP(fp_);
+  Ref* saved_fp = FrameSavedFP(fp_);
   if (saved_fp == 0) {
     LocalBaseReturn(result);  // SAFEPOINT
     return;
@@ -975,7 +975,7 @@ void Interpreter::LocalBaseReturn(Object result) {
     return;
   }
 
-  top->set_sender(static_cast<Activation>(nil), kNoBarrier);
+  top->set_sender(static_cast<Activation>(nil));
   top->set_bci(static_cast<SmallInteger>(nil));
 
   CreateBaseFrame(sender);
@@ -997,7 +997,7 @@ void Interpreter::NonLocalReturn(Object result) {
     c = home->closure();
   }
 
-  for (Object* fp = FrameSavedFP(fp_); fp != 0; fp = FrameSavedFP(fp)) {
+  for (Ref* fp = FrameSavedFP(fp_); fp != 0; fp = FrameSavedFP(fp)) {
     if (FrameActivation(fp) == home) {
       if (FrameSavedFP(fp) == 0) {
         break;  // Return crosses base frame.
@@ -1070,7 +1070,7 @@ void Interpreter::NonLocalReturn(Object result) {
   Activation zap = top;
   do {
     Activation next = zap->sender();
-    zap->set_sender(static_cast<Activation>(nil), kNoBarrier);
+    zap->set_sender(static_cast<Activation>(nil));
     zap->set_bci(static_cast<SmallInteger>(nil));
     zap = next;
   } while (zap != sender);
@@ -1116,11 +1116,12 @@ void Interpreter::Exit() {
 
 void Interpreter::ActivateDispatch(Method method, intptr_t num_args) {
   ASSERT(method->Primitive() == 0);
+  ASSERT((Object)(uword)ip_ == nil);
   Interpreter::Activate(method, num_args);
 }
 
 void Interpreter::ReturnFromDispatch() {
-  Object* saved_fp = FrameSavedFP(fp_);
+  Ref* saved_fp = FrameSavedFP(fp_);
   if (saved_fp == 0) {
     // Base frame.
     Activation sender = FrameBaseSender(fp_);
@@ -1152,7 +1153,7 @@ void Interpreter::Interpret() {
     ASSERT(sp_ != 0);
     ASSERT(fp_ != 0);
 
-    uint8_t byte1 = *ip_++;
+    uint8_t byte1 = Fetch();
     switch (byte1) {
     case 0: case 1: case 2: case 3: case 4: case 5: case 6: case 7:
     case 8: case 9: case 10: case 11: case 12: case 13: case 14: case 15:
@@ -1178,13 +1179,13 @@ void Interpreter::Interpret() {
     case 77:
       switch (extB) {
         case 0:
-          Push(false_);
+          Push(false_.to);
           break;
         case 1:
-          Push(true_);
+          Push(true_.to);
           break;
         case 2:
-          Push(nil_);
+          Push(nil_.to);
           break;
         case 3:
           FATAL("Unused bytecode");  // V4: push thisContext
@@ -1241,9 +1242,9 @@ void Interpreter::Interpret() {
       if (left->IsSmallInteger() && right->IsSmallInteger()) {
         if (static_cast<intptr_t>(left) <
             static_cast<intptr_t>(right)) {
-          PopNAndPush(2, true_);
+          PopNAndPush(2, true_.to);
         } else {
-          PopNAndPush(2, false_);
+          PopNAndPush(2, false_.to);
         }
         break;
       }
@@ -1257,9 +1258,9 @@ void Interpreter::Interpret() {
       if (left->IsSmallInteger() && right->IsSmallInteger()) {
         if (static_cast<intptr_t>(left) >
             static_cast<intptr_t>(right)) {
-          PopNAndPush(2, true_);
+          PopNAndPush(2, true_.to);
         } else {
-          PopNAndPush(2, false_);
+          PopNAndPush(2, false_.to);
         }
         break;
       }
@@ -1273,9 +1274,9 @@ void Interpreter::Interpret() {
       if (left->IsSmallInteger() && right->IsSmallInteger()) {
         if (static_cast<intptr_t>(left) <=
             static_cast<intptr_t>(right)) {
-          PopNAndPush(2, true_);
+          PopNAndPush(2, true_.to);
         } else {
-          PopNAndPush(2, false_);
+          PopNAndPush(2, false_.to);
         }
         break;
       }
@@ -1289,9 +1290,9 @@ void Interpreter::Interpret() {
       if (left->IsSmallInteger() && right->IsSmallInteger()) {
         if (static_cast<intptr_t>(left) >=
             static_cast<intptr_t>(right)) {
-          PopNAndPush(2, true_);
+          PopNAndPush(2, true_.to);
         } else {
-          PopNAndPush(2, false_);
+          PopNAndPush(2, false_.to);
         }
         break;
       }
@@ -1305,9 +1306,9 @@ void Interpreter::Interpret() {
       if (left->IsSmallInteger() && right->IsSmallInteger()) {
         if (static_cast<intptr_t>(left) ==
             static_cast<intptr_t>(right)) {
-          PopNAndPush(2, true_);
+          PopNAndPush(2, true_.to);
         } else {
-          PopNAndPush(2, false_);
+          PopNAndPush(2, false_.to);
         }
         break;
       }
@@ -1537,12 +1538,12 @@ void Interpreter::Interpret() {
       FATAL("Unused bytecode");
       break;
     case 224: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       extA = (extA << 8) + byte2;
       break;
     }
     case 225: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       if (extB == 0 && byte2 > 127) {
         extB = byte2 - 256;
       } else {
@@ -1554,30 +1555,30 @@ void Interpreter::Interpret() {
       FATAL("Unused bytecode");  // V4: push receiver variable
       break;
     case 227: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       PushLiteralVariable((extA << 8) + byte2);
       extA = 0;
       break;
     }
     case 228: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       PushLiteral(byte2 + extA * 256);
       extA = 0;
       break;
     }
     case 229: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       Push(SmallInteger::New((extB << 8) + byte2));
       extB = 0;
       break;
     }
     case 230: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       PushTemporary(byte2);
       break;
     }
     case 231: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       if (byte2 < 128) {
         PushNewArray(byte2);
       } else {
@@ -1590,7 +1591,7 @@ void Interpreter::Interpret() {
       FATAL("Unused bytecode");
       break;
     case 234: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       StoreIntoTemporary(byte2);
       break;
     }
@@ -1599,12 +1600,12 @@ void Interpreter::Interpret() {
       FATAL("Unused bytecode");
       break;
     case 237: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       PopIntoTemporary(byte2);
       break;
     }
     case 238: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t selector_index = (extA << 5) + (byte2 >> 3);
       intptr_t num_args = (extB << 3) | (byte2 & 7);
       extA = extB = 0;
@@ -1615,7 +1616,7 @@ void Interpreter::Interpret() {
       FATAL("Unused bytecode");  // V4: static super send
       break;
     case 240: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t selector_index = (extA << 5) + (byte2 >> 3);
       intptr_t num_args = (extB << 3) | (byte2 & 7);
       extA = extB = 0;
@@ -1623,7 +1624,7 @@ void Interpreter::Interpret() {
       break;
     }
     case 241: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t selector_index = (extA << 5) + (byte2 >> 3);
       intptr_t num_args = (extB << 3) | (byte2 & 7);
       extA = extB = 0;
@@ -1631,40 +1632,40 @@ void Interpreter::Interpret() {
       break;
     }
     case 242: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t delta = (extB << 8) + byte2;
       extB = 0;
-      ip_ += delta;
+      ip_ += (delta * 2);
       break;
     }
     case 243: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t delta = (extB << 8) + byte2;
       extB = 0;
       Object top = Pop();
-      if (top == false_) {
-      } else if (top == true_) {
-        ip_ += delta;
+      if (top == false_.to) {
+      } else if (top == true_.to) {
+        ip_ += (delta * 2);
       } else {
         SendNonBooleanReceiver(top);
       }
       break;
     }
     case 244: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t delta = (extB << 8) + byte2;
       extB = 0;
       Object top = Pop();
-      if (top == true_) {
-      } else if (top == false_) {
-        ip_ += delta;
+      if (top == true_.to) {
+      } else if (top == false_.to) {
+        ip_ += (delta * 2);
       } else {
         SendNonBooleanReceiver(top);
       }
       break;
     }
     case 245: {
-      uint8_t byte2 = *ip_++;
+      uint8_t byte2 = Fetch();
       intptr_t selector_index = (extA << 5) + (byte2 >> 3);
       intptr_t num_args = (extB << 3) | (byte2 & 7);
       extA = extB = 0;
@@ -1677,26 +1678,26 @@ void Interpreter::Interpret() {
     case 249:  // V4: call primitive
       FATAL("Unused bytecode");
     case 250: {
-      uint8_t byte2 = *ip_++;
-      uint8_t byte3 = *ip_++;
+      uint8_t byte2 = Fetch();
+      uint8_t byte3 = Fetch();
       PushRemoteTemp(byte3, byte2);
       break;
     }
     case 251: {
-      uint8_t byte2 = *ip_++;
-      uint8_t byte3 = *ip_++;
+      uint8_t byte2 = Fetch();
+      uint8_t byte3 = Fetch();
       StoreIntoRemoteTemp(byte3, byte2);
       break;
     }
     case 252: {
-      uint8_t byte2 = *ip_++;
-      uint8_t byte3 = *ip_++;
+      uint8_t byte2 = Fetch();
+      uint8_t byte3 = Fetch();
       PopIntoRemoteTemp(byte3, byte2);
       break;
     }
     case 253: {
-      uint8_t byte2 = *ip_++;
-      uint8_t byte3 = *ip_++;
+      uint8_t byte2 = Fetch();
+      uint8_t byte3 = Fetch();
       intptr_t num_copied = (byte2 >> 3 & 7) + ((extA / 16) << 3);
       intptr_t num_args = (byte2 & 7) + ((extA % 16) << 3);
       intptr_t block_size = byte3 + (extB << 8);
@@ -1705,8 +1706,8 @@ void Interpreter::Interpret() {
       break;
     }
     case 254: {
-      uint8_t byte2 = *ip_++;
-      uint8_t byte3 = *ip_++;
+      uint8_t byte2 = Fetch();
+      uint8_t byte3 = Fetch();
       intptr_t selector_index = (extA << 5) + (byte2 >> 3);
       intptr_t num_args = (extB << 3) | (byte2 & 7);
       intptr_t depth = byte3;
@@ -1724,26 +1725,29 @@ void Interpreter::Interpret() {
 }
 
 
-Activation Interpreter::EnsureActivation(Object* fp) {
+Activation Interpreter::EnsureActivation(Ref* fp) {
   Activation activation = FrameActivation(fp);
   if (activation == nullptr) {
     activation = H->AllocateActivation();  // SAFEPOINT
-    activation->set_sender_fp(fp);
-    activation->set_bci(static_cast<SmallInteger>(nil));
-    activation->set_method(FrameMethod(fp));
+    activation->init_sender_fp(fp);
+    activation->init_bci(static_cast<SmallInteger>(nil));
+    activation->init_method(FrameMethod(fp));
     if (FlagsIsClosure(FrameFlags(fp))) {
       Closure closure = static_cast<Closure>(FrameTemp(fp, -1));
       ASSERT(closure->IsClosure());
-      activation->set_closure(closure);
+      activation->init_closure(closure);
     } else {
-      activation->set_closure(static_cast<Closure>(nil), kNoBarrier);
+      activation->init_closure(static_cast<Closure>(nil));
     }
-    activation->set_receiver(FrameReceiver(fp));
+    activation->init_receiver(FrameReceiver(fp));
     // Note this differs from Cog, which also copies the parameters. It may help
     // some debugging cases if parameters remain available in returned-from
     // activations, but for now it is slightly simpler to treat all locals
     // uniformly.
-    activation->set_stack_depth(SmallInteger::New(0));
+    activation->init_stack_depth(SmallInteger::New(0));
+    for (intptr_t i = 0; i < kMaxTemps; i++) {
+      activation->init_temp(i, SmallInteger::New(0));
+    }
 
     FrameActivationPut(fp, activation);
   }
@@ -1758,7 +1762,7 @@ Activation Interpreter::FlushAllFrames() {
   while (fp_ != 0) {
     EnsureActivation(fp_);  // SAFEPOINT
 
-    Object* saved_fp = FrameSavedFP(fp_);
+    Ref* saved_fp = FrameSavedFP(fp_);
     Activation sender;
     if (saved_fp != 0) {
       sender = EnsureActivation(saved_fp);  // SAFEPOINT
@@ -1787,11 +1791,11 @@ Activation Interpreter::FlushAllFrames() {
   ip_ = 0;  // Was base sender.
   ASSERT(sp_ == stack_base_);
   ASSERT(fp_ == 0);
-#if defined(DEBUG)
-  for (intptr_t i = 0; i < kStackSlots; i++) {
-    stack_limit_[i] = static_cast<Object>(kUninitializedWord);
-  }
-#endif
+  //#if defined(DEBUG)
+  //  for (intptr_t i = 0; i < kStackSlots; i++) {
+  //    stack_limit_[i] = static_cast<Object>(kUninitializedWord);
+  //  }
+  //#endif
 
   return top;
 }
@@ -1802,8 +1806,8 @@ bool Interpreter::HasLivingFrame(Activation activation) {
     return false;
   }
 
-  Object* activation_fp = activation->sender_fp();
-  Object* fp = fp_;
+  Ref* activation_fp = activation->sender_fp();
+  Ref* fp = fp_;
   while (fp != 0) {
     if (fp == activation_fp) {
       if (FrameActivation(fp) == activation) {
@@ -1815,7 +1819,7 @@ bool Interpreter::HasLivingFrame(Activation activation) {
   }
 
   // Frame is gone.
-  activation->set_sender(static_cast<Activation>(nil), kNoBarrier);
+  activation->set_sender(static_cast<Activation>(nil));
   activation->set_bci(static_cast<SmallInteger>(nil));
   return false;
 }
@@ -1840,8 +1844,8 @@ void Interpreter::SetCurrentActivation(Activation new_activation) {
 
 Object Interpreter::ActivationSender(Activation activation) {
   if (HasLivingFrame(activation)) {
-    Object* fp = activation->sender_fp();
-    Object* sender_fp = FrameSavedFP(fp);
+    Ref* fp = activation->sender_fp();
+    Ref* sender_fp = FrameSavedFP(fp);
     if (sender_fp == 0) {
       return FrameBaseSender(fp);
     }
@@ -1873,8 +1877,8 @@ void Interpreter::ActivationSenderPut(Activation activation,
 
 Object Interpreter::ActivationBCI(Activation activation) {
   if (activation->sender()->IsSmallInteger()) {
-    Object* activation_fp = activation->sender_fp();
-    Object* fp = fp_;
+    Ref* activation_fp = activation->sender_fp();
+    Ref* fp = fp_;
     const uint8_t* ip = ip_;
     while (fp != 0) {
       if (fp == activation_fp) {
@@ -1887,7 +1891,7 @@ Object Interpreter::ActivationBCI(Activation activation) {
       fp = FrameSavedFP(fp);
     }
     // Frame is gone.
-    activation->set_sender(static_cast<Activation>(nil), kNoBarrier);
+    activation->set_sender(static_cast<Activation>(nil));
     activation->set_bci(static_cast<SmallInteger>(nil));
   }
 
@@ -1965,7 +1969,7 @@ void Interpreter::ActivationReceiverPut(Activation activation,
 
 Object Interpreter::ActivationTempAt(Activation activation, intptr_t index) {
   if (HasLivingFrame(activation)) {
-    Object* fp = activation->sender_fp();
+    Ref* fp = activation->sender_fp();
     return FrameTemp(fp, index);
   } else {
     return activation->temp(index);
@@ -1977,7 +1981,7 @@ void Interpreter::ActivationTempAtPut(Activation activation,
                                       intptr_t index,
                                       Object value) {
   if (HasLivingFrame(activation)) {
-    Object* fp = activation->sender_fp();
+    Ref* fp = activation->sender_fp();
     return FrameTempPut(fp, index, value);
   } else {
     return activation->set_temp(index, value);
@@ -1988,9 +1992,9 @@ void Interpreter::ActivationTempAtPut(Activation activation,
 
 intptr_t Interpreter::ActivationTempSize(Activation activation) {
   if (activation->sender()->IsSmallInteger()) {
-    Object* activation_fp = activation->sender_fp();
-    Object* sp = sp_;
-    Object* fp = fp_;
+    Ref* activation_fp = activation->sender_fp();
+    Ref* sp = sp_;
+    Ref* fp = fp_;
     while (fp != 0) {
       if (fp == activation_fp) {
         if (FrameActivation(fp) == activation) {
@@ -2003,7 +2007,7 @@ intptr_t Interpreter::ActivationTempSize(Activation activation) {
     }
 
     // Frame is gone.
-    activation->set_sender(static_cast<Activation>(nil), kNoBarrier);
+    activation->set_sender(static_cast<Activation>(nil));
     activation->set_bci(static_cast<SmallInteger>(nil));
   }
 
@@ -2022,52 +2026,20 @@ void Interpreter::ActivationTempSizePut(Activation activation,
     }
     intptr_t old_size = activation->StackDepth();
     for (intptr_t i = old_size; i < new_size; i++) {
-      activation->set_temp(i, nil, kNoBarrier);
+      activation->set_temp(i, nil);
     }
     activation->set_stack_depth(SmallInteger::New(new_size));
     CreateBaseFrame(top);
   } else {
     intptr_t old_size = activation->StackDepth();
     for (intptr_t i = old_size; i < new_size; i++) {
-      activation->set_temp(i, nil, kNoBarrier);
+      activation->set_temp(i, nil);
     }
     activation->set_stack_depth(SmallInteger::New(new_size));
   }
 }
 
-
-void Interpreter::GCPrologue() {
-  // Convert IPs to BCIs. The makes every slot on the stack a valid object
-  // pointer. Frame flags and saved FPs are valid as SmallIntegers.
-
-  Object* fp = fp_;
-  const uint8_t** ip_slot = &ip_;
-
-  while (fp != 0) {
-    SmallInteger bci = FrameMethod(fp)->BCI(*ip_slot);
-    *ip_slot = reinterpret_cast<const uint8_t*>(static_cast<uword>(bci));
-
-    ip_slot = FrameSavedIPSlot(fp);
-    fp = FrameSavedFP(fp);
-  }
-}
-
-
-void Interpreter::GCEpilogue() {
-  // Convert BCIs to IPs. Invalidate lookup caches.
-
-  Object* fp = fp_;
-  const uint8_t** ip_slot = &ip_;
-
-  while (fp != 0) {
-    const SmallInteger bci =
-        static_cast<const SmallInteger>(reinterpret_cast<uword>(*ip_slot));
-    *ip_slot = FrameMethod(fp)->IP(bci);
-
-    ip_slot = FrameSavedIPSlot(fp);
-    fp = FrameSavedFP(fp);
-  }
-
+void Interpreter::ClearCache() {
 #if LOOKUP_CACHE
   lookup_cache_.Clear();
 #endif

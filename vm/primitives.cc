@@ -1161,8 +1161,16 @@ DEFINE_PRIMITIVE(Behavior_basicNew) {
   RegularObject new_instance = H->AllocateRegularObject(id->value(),
                                                          num_slots);
   for (intptr_t i = 0; i < num_slots; i++) {
-    new_instance->set_slot(i, nil, kNoBarrier);
+    new_instance->init_slot(i, nil);
   }
+
+  Ref* from;
+  Ref* to;
+  new_instance->Pointers(&from, &to);
+  for (Ref* ptr = from; ptr <= to; ptr++) {
+    ASSERT((uword)ptr->to != kUninitializedWord);
+  }
+
   RETURN(new_instance);
 }
 
@@ -1208,7 +1216,7 @@ DEFINE_PRIMITIVE(Array_class_new) {
   }
   Array result = H->AllocateArray(length);  // SAFEPOINT
   for (intptr_t i = 0; i < length; i++) {
-    result->set_element(i, nil, kNoBarrier);
+    result->init_element(i, nil);
   }
   RETURN(result);
 }
@@ -1258,7 +1266,7 @@ DEFINE_PRIMITIVE(WeakArray_class_new) {
   }
   WeakArray result = H->AllocateWeakArray(length);  // SAFEPOINT
   for (intptr_t i = 0; i < length; i++) {
-    result->set_element(i, nil, kNoBarrier);
+    result->init_element(i, nil);
   }
   RETURN(result);
 }
@@ -1658,12 +1666,15 @@ DEFINE_PRIMITIVE(Activation_tempSizePut) {
 DEFINE_PRIMITIVE(Activation_class_new) {
   ASSERT(num_args == 0);
   Activation result = H->AllocateActivation();  // SAFEPOINT
-  result->set_sender(static_cast<Activation>(nil), kNoBarrier);
-  result->set_bci(static_cast<SmallInteger>(nil));
-  result->set_method(static_cast<Method>(nil), kNoBarrier);
-  result->set_closure(static_cast<Closure>(nil), kNoBarrier);
-  result->set_receiver(nil, kNoBarrier);
-  result->set_stack_depth(SmallInteger::New(0));
+  result->init_sender(static_cast<Activation>(nil));
+  result->init_bci(static_cast<SmallInteger>(nil));
+  result->init_method(static_cast<Method>(nil));
+  result->init_closure(static_cast<Closure>(nil));
+  result->init_receiver(nil);
+  result->init_stack_depth(SmallInteger::New(0));
+  for (intptr_t i = 0; i < kMaxTemps; i++) {
+    result->init_temp(i, SmallInteger::New(0));
+  }
   RETURN(result);
 }
 
@@ -1696,11 +1707,11 @@ DEFINE_PRIMITIVE(Closure_class_new) {
   closure_num_args = static_cast<SmallInteger>(I->Stack(1));
   num_copied = static_cast<SmallInteger>(I->Stack(0));
 
-  result->set_defining_activation(defining_activation);
-  result->set_initial_bci(initial_bci);
-  result->set_num_args(closure_num_args);
+  result->init_defining_activation(defining_activation);
+  result->init_initial_bci(initial_bci);
+  result->init_num_args(closure_num_args);
   for (intptr_t i = 0; i < num_copied->value(); i++) {
-    result->set_copied(i, nil, kNoBarrier);
+    result->init_copied(i, nil);
   }
 
   RETURN(result);
@@ -1839,7 +1850,7 @@ DEFINE_PRIMITIVE(Object_identityHash) {
   } else {
     hash = static_cast<HeapObject>(receiver)->header_hash();
     if (hash == 0) {
-      hash = I->isolate()->random().NextUInt64() & SmallInteger::kMaxValue;
+      hash = I->isolate()->random().NextUInt64() & 0x7FFFFFFF;
       if (hash == 0) {
         hash = 1;
       }
@@ -2898,7 +2909,7 @@ DEFINE_PRIMITIVE(ZXChannel_read) {
   }
   if (status == ZX_OK) {
     for (intptr_t i = 0; i < actual_handles; i++) {
-      handles->set_element(i, SmallInteger::New(raw_handles[i]));
+      handles->init_element(i, SmallInteger::New(raw_handles[i]));
     }
     multiple_return->set_element(0, bytes);
     multiple_return->set_element(1, handles);

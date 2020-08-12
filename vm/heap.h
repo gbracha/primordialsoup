@@ -15,7 +15,6 @@
 namespace psoup {
 
 class Interpreter;
-class Region;
 
 // Note these values are never valid Object.
 #if defined(ARCH_IS_32_BIT)
@@ -32,84 +31,12 @@ static intptr_t AllocationSize(intptr_t size) {
   return Utils::RoundUp(size, kObjectAlignment);
 }
 
-class Semispace {
- private:
-  friend class Heap;
-
-  void Allocate(size_t size) {
-    memory_ = VirtualMemory::Allocate(size,
-                                      VirtualMemory::kReadWrite,
-                                      "primordialsoup-heap");
-    ASSERT(Utils::IsAligned(memory_.base(), kObjectAlignment));
-    ASSERT(memory_.size() == size);
-#if defined(DEBUG)
-    MarkUnallocated();
-#endif
-  }
-
-  void Free() { memory_.Free(); }
-
-  size_t size() const { return memory_.size(); }
-  uword base() const { return memory_.base(); }
-  uword limit() const { return memory_.limit(); }
-  uword object_start() const {
-    return memory_.base() + kNewObjectAlignmentOffset;
-  }
-
-  void MarkUnallocated() const {
-    memset(reinterpret_cast<void*>(base()), kUnallocatedByte, size());
-  }
-
-  void ReadWrite() { memory_.Protect(VirtualMemory::kReadWrite); }
-  void NoAccess() { memory_.Protect(VirtualMemory::kNoAccess); }
-
-  Semispace() : memory_() { }
-
-  VirtualMemory memory_;
-};
-
-class FreeList {
- private:
-  friend class Heap;
-
-  FreeList() { Reset(); }
-
-  uword TryAllocate(intptr_t size);
-
-  intptr_t IndexForSize(intptr_t size) {
-    intptr_t index = size >> kObjectAlignmentLog2;
-    if (index > kSizeClasses) {
-      return kSizeClasses;
-    }
-    return index;
-  }
-
-  void SplitAndRequeue(FreeListElement element, intptr_t size);
-  FreeListElement Dequeue(intptr_t index);
-  void Enqueue(FreeListElement element);
-  void EnqueueRange(uword address, intptr_t size);
-  void Reset() {
-    for (intptr_t i = 0; i <= kSizeClasses; i++) {
-      free_lists_[i] = nullptr;
-    }
-  }
-
-  static const intptr_t kSizeClasses = 7;
-  FreeListElement free_lists_[kSizeClasses + 1];
-};
-
 // C. J. Cheney. "A nonrecursive list compacting algorithm." Communications of
 // the ACM. 1970.
 //
 // Barry Hayes. "Ephemerons: a New Finalization Mechanism." Object-Oriented
 // Languages, Programming, Systems, and Applications. 1997.
 class Heap {
- private:
-  static const intptr_t kLargeAllocation = 32 * KB;
-  static const size_t kInitialSemispaceCapacity = sizeof(uword) * MB / 8;
-  static const size_t kMaxSemispaceCapacity = 2 * sizeof(uword) * MB;
-  static const size_t kRegionSize = 256 * KB;
-
  public:
   enum Allocator { kNormal, kSnapshot };
 
@@ -140,33 +67,17 @@ class Heap {
   Heap();
   ~Heap();
 
-  void AddToRememberedSet(HeapObject object) {
-    ASSERT(object->IsOldObject());
-    ASSERT(!object->is_remembered());
-    if (remembered_set_size_ == remembered_set_capacity_) {
-      GrowRememberedSet();
-    }
-    remembered_set_[remembered_set_size_++] = object;
-    object->set_is_remembered(true);
-  }
-
   RegularObject AllocateRegularObject(intptr_t cid, intptr_t num_slots,
                                       Allocator allocator = kNormal) {
     ASSERT(cid == kEphemeronCid || cid >= kFirstRegularObjectCid);
     const intptr_t heap_size =
-        AllocationSize(num_slots * sizeof(Object) + sizeof(HeapObject::Layout));
+        AllocationSize(num_slots * sizeof(Ref) + sizeof(HeapObject::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, cid, heap_size);
+    RegisterInstance(obj);
     RegularObject result = static_cast<RegularObject>(obj);
     ASSERT(result->IsRegularObject() || result->IsEphemeron());
     ASSERT(result->HeapSize() == heap_size);
-
-    const intptr_t header_slots = sizeof(HeapObject::Layout) / sizeof(uword);
-    if (((header_slots + num_slots) & 1) == 1) {
-      // The leftover slot will be visited by the GC. Make it a valid oop.
-      result->set_slot(num_slots, SmallInteger::New(0), kNoBarrier);
-    }
-
     return result;
   }
 
@@ -176,8 +87,9 @@ class Heap {
         AllocationSize(num_bytes * sizeof(uint8_t) + sizeof(ByteArray::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kByteArrayCid, heap_size);
+    RegisterInstance(obj);
     ByteArray result = static_cast<ByteArray>(obj);
-    result->set_size(SmallInteger::New(num_bytes));
+    result->init_size(SmallInteger::New(num_bytes));
     ASSERT(result->IsByteArray());
     ASSERT(result->HeapSize() == heap_size);
     return result;
@@ -188,8 +100,9 @@ class Heap {
         AllocationSize(num_bytes * sizeof(uint8_t) + sizeof(String::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kStringCid, heap_size);
+    RegisterInstance(obj);
     String result = static_cast<String>(obj);
-    result->set_size(SmallInteger::New(num_bytes));
+    result->init_size(SmallInteger::New(num_bytes));
     ASSERT(result->IsString());
     ASSERT(result->HeapSize() == heap_size);
     return result;
@@ -197,11 +110,12 @@ class Heap {
 
   Array AllocateArray(intptr_t num_slots, Allocator allocator = kNormal) {
     const intptr_t heap_size =
-        AllocationSize(num_slots * sizeof(Object) + sizeof(Array::Layout));
+        AllocationSize(num_slots * sizeof(Ref) + sizeof(Array::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kArrayCid, heap_size);
+    RegisterInstance(obj);
     Array result = static_cast<Array>(obj);
-    result->set_size(SmallInteger::New(num_slots));
+    result->init_size(SmallInteger::New(num_slots));
     ASSERT(result->IsArray());
     ASSERT(result->HeapSize() == heap_size);
     return result;
@@ -210,11 +124,12 @@ class Heap {
   WeakArray AllocateWeakArray(intptr_t num_slots,
                               Allocator allocator = kNormal) {
     const intptr_t heap_size =
-        AllocationSize(num_slots * sizeof(Object) + sizeof(WeakArray::Layout));
+        AllocationSize(num_slots * sizeof(Ref) + sizeof(WeakArray::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kWeakArrayCid, heap_size);
+    RegisterInstance(obj);
     WeakArray result = static_cast<WeakArray>(obj);
-    result->set_size(SmallInteger::New(num_slots));
+    result->init_size(SmallInteger::New(num_slots));
     ASSERT(result->IsWeakArray());
     ASSERT(result->HeapSize() == heap_size);
     return result;
@@ -222,11 +137,12 @@ class Heap {
 
   Closure AllocateClosure(intptr_t num_copied, Allocator allocator = kNormal) {
     const intptr_t heap_size =
-        AllocationSize(num_copied * sizeof(Object) + sizeof(Closure::Layout));
+        AllocationSize(num_copied * sizeof(Ref) + sizeof(Closure::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kClosureCid, heap_size);
+    RegisterInstance(obj);
     Closure result = static_cast<Closure>(obj);
-    result->set_num_copied(SmallInteger::New(num_copied));
+    result->init_num_copied(SmallInteger::New(num_copied));
     ASSERT(result->IsClosure());
     ASSERT(result->HeapSize() == heap_size);
     return result;
@@ -236,6 +152,7 @@ class Heap {
     const intptr_t heap_size = AllocationSize(sizeof(Activation::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kActivationCid, heap_size);
+    RegisterInstance(obj);
     Activation result = static_cast<Activation>(obj);
     ASSERT(result->IsActivation());
     ASSERT(result->HeapSize() == heap_size);
@@ -246,6 +163,7 @@ class Heap {
     const intptr_t heap_size = AllocationSize(sizeof(MediumInteger::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kMintCid, heap_size);
+    RegisterInstance(obj);
     MediumInteger result = static_cast<MediumInteger>(obj);
     ASSERT(result->IsMediumInteger());
     ASSERT(result->HeapSize() == heap_size);
@@ -258,6 +176,7 @@ class Heap {
                                               sizeof(LargeInteger::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kBigintCid, heap_size);
+    RegisterInstance(obj);
     LargeInteger result = static_cast<LargeInteger>(obj);
     result->set_capacity(capacity);
     ASSERT(result->IsLargeInteger());
@@ -269,6 +188,7 @@ class Heap {
     const intptr_t heap_size = AllocationSize(sizeof(Float64::Layout));
     uword addr = Allocate(heap_size, allocator);
     HeapObject obj = HeapObject::Initialize(addr, kFloat64Cid, heap_size);
+    RegisterInstance(obj);
     Float64 result = static_cast<Float64>(obj);
     ASSERT(result->IsFloat64());
     ASSERT(result->HeapSize() == heap_size);
@@ -278,11 +198,10 @@ class Heap {
   Message AllocateMessage();
 
   size_t Size() const {
-    size_t new_size = top_ - to_.object_start();
-    return new_size + old_size_;
+    return heap_size_;
   }
 
-  void CollectAll(Reason reason) { MarkSweep(reason); }
+  void CollectAll(Reason reason);
 
   intptr_t CountInstances(intptr_t cid);
   intptr_t CollectInstances(intptr_t cid, Array array);
@@ -296,11 +215,20 @@ class Heap {
     cls->set_id(SmallInteger::New(cid));
     cls->AssertCouldBeBehavior();
     ASSERT(cls->cid() >= kFirstRegularObjectCid);
+    cls->set_in_class_table(true);
   }
   Behavior ClassAt(intptr_t cid) const {
     ASSERT(cid > kIllegalCid);
     ASSERT(cid < class_table_size_);
     return static_cast<Behavior>(class_table_[cid]);
+  }
+  void RegisterInstance(HeapObject obj) {
+    if (table_size_ == table_capacity_) {
+      TableGrow();
+    }
+    intptr_t index = table_size_++;
+    table_[index] = obj;
+    obj->set_table_index(index);
   }
 
   void InitializeInterpreter(Interpreter* interpreter) {
@@ -315,116 +243,23 @@ class Heap {
   void set_handles(intptr_t value) { handles_size_ = value; }
 
  private:
-  void GrowRememberedSet();
-  void ShrinkRememberedSet();
-
-  // Scavenging.
-  void Scavenge(Reason reason);
-  void FlipSpaces();
-  void ScavengeRoots();
-  uword ScavengeToSpace(uword scan);
-  void PushTenureStack(uword addr);
-  uword PopTenureStack();
-  bool IsTenureStackEmpty();
-  void ProcessTenureStack();
-  void ScavengePointer(Object* ptr);
-  void ScavengeOldObject(HeapObject obj);
-  void ScavengeClass(intptr_t cid);
-
-  // Mark-sweep.
-  void MarkSweep(Reason reason);
-  void MarkRoots();
-  void MarkObject(Object obj);
-  void ProcessMarkStack();
-  void Sweep();
-  bool SweepRegion(Region* region);
-  void SetOldAllocationLimit();
-
-  // Ephemerons.
-  void AddToEphemeronList(Ephemeron ephemeron_corpse);
-  void ScavengeEphemeronList();
-  void MarkEphemeronList();
-  void MournEphemeronList();
-
-  // WeakArrays.
-  void AddToWeakList(WeakArray survivor);
-  void MournWeakListScavenge();
-  void MournWeakListMarkSweep();
-  void MournWeakPointerScavenge(Object* ptr);
-  void MournWeakPointerMarkSweep(Object* ptr);
-
-  // Weak class table.
-  void MournClassTableScavenge();
-  void MournClassTableMarkSweep();
-  void MournClassTableForwarded();
+  void Verify();
+  void GCStep();
+  bool CheckReachable(HeapObject obj);
+  void WorklistPush(HeapObject obj);
+  void TableGrow();
+  void Unlink(HeapObject obj);
+  void Free(HeapObject obj);
 
   // Become.
   void ForwardClassIds();
   void ForwardRoots();
   void ForwardHeap();
+  void MournClassTableForwarded();
 
-  uword TryAllocateNew(intptr_t size) {
-    uword result = top_;
-    intptr_t remaining = end_ - top_;
-    if (remaining < size) {
-      return 0;
-    }
-    ASSERT((result & kObjectAlignmentMask) == kNewObjectAlignmentOffset);
-    top_ += size;
-    return result;
-  }
+  uword Allocate(intptr_t size, Allocator allocator);
 
-  uword Allocate(intptr_t size, Allocator allocator) {
-    ASSERT(Utils::IsAligned(size, kObjectAlignment));
-    if (allocator == kSnapshot) {
-      if (size >= kLargeAllocation) {
-        return AllocateSnapshotLarge(size);
-      }
-      return AllocateSnapshotSmall(size);
-    }
-    if (size >= kLargeAllocation) {
-      return AllocateOldLarge(size, kControlGrowth);
-    }
-    return AllocateNew(size);
-  }
-
-  uword AllocateNew(intptr_t size);
-  uword AllocateTenure(intptr_t size);
-  uword AllocateOldSmall(intptr_t size, GrowthPolicy growth);
-  uword AllocateOldLarge(intptr_t size, GrowthPolicy growth);
-  uword AllocateSnapshotSmall(intptr_t size);
-  uword AllocateSnapshotLarge(intptr_t size);
-
-  Region* AllocateRegion(intptr_t region_size, GrowthPolicy growth);
-
-#if defined(DEBUG)
-  bool InFromSpace(HeapObject obj) {
-    return (obj->Addr() >= from_.base()) && (obj->Addr() < from_.limit());
-  }
-  bool InToSpace(HeapObject obj) {
-    return (obj->Addr() >= to_.base()) && (obj->Addr() < to_.limit());
-  }
-#endif
-
-  // New space.
-  uword top_;
-  uword end_;
-  uword survivor_end_;
-  Semispace to_;
-  Semispace from_;
-  size_t next_semispace_capacity_;
-
-  // Old space.
-  Region* regions_;
-  FreeList freelist_;
-  size_t old_size_;
-  size_t old_capacity_;
-  size_t old_limit_;
-
-  // Remembered set.
-  HeapObject* remembered_set_;
-  intptr_t remembered_set_size_;
-  intptr_t remembered_set_capacity_;
+  size_t heap_size_;
 
   // Class table.
   Object* class_table_;
@@ -432,15 +267,19 @@ class Heap {
   intptr_t class_table_capacity_;
   intptr_t class_table_free_;
 
+  HeapObject* worklist_;
+  intptr_t worklist_size_;
+  intptr_t worklist_capacity_;
+  HeapObject* table_;
+  intptr_t table_size_;
+  intptr_t table_capacity_;
+
   // Roots.
   Interpreter* interpreter_;
   static const intptr_t kHandlesCapacity = 8;
   Object* handles_[kHandlesCapacity];
   intptr_t handles_size_;
   friend class HandleScope;
-
-  Ephemeron ephemeron_list_;
-  WeakArray weak_list_;
 
   int64_t max_gc_time_;
   int64_t total_gc_time_;

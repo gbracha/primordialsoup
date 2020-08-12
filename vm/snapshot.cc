@@ -19,6 +19,7 @@ class Cluster {
 
   virtual void ReadNodes(Deserializer* d, Heap* h) = 0;
   virtual void ReadEdges(Deserializer* d, Heap* h) = 0;
+  virtual void PostLoad(Heap* h) {}
 
  protected:
   intptr_t ref_start_;
@@ -43,20 +44,24 @@ class RegularObjectCluster : public Cluster {
   }
 
   void ReadEdges(Deserializer* d, Heap* h) {
-    Object cls = d->ReadRef();
-    h->RegisterClass(cid_, static_cast<Behavior>(cls));
+    cls_ = d->ReadRef();
 
     for (intptr_t i = ref_start_; i < ref_stop_; i++) {
       RegularObject object = static_cast<RegularObject>(d->Ref(i));
       for (intptr_t j = 0; j < format_; j++) {
-        object->set_slot(j, d->ReadRef(), kNoBarrier);
+        object->init_slot(j, d->ReadRef());
       }
     }
+  }
+
+  void PostLoad(Heap* h) {
+    h->RegisterClass(cid_, static_cast<Behavior>(cls_));
   }
 
  private:
   intptr_t format_;
   intptr_t cid_;
+  Object cls_;
 };
 
 class ByteArrayCluster : public Cluster {
@@ -135,7 +140,7 @@ class ArrayCluster : public Cluster {
       Array object = Array::Cast(d->Ref(i));
       intptr_t size = object->Size();
       for (intptr_t j = 0; j < size; j++) {
-        object->set_element(j, d->ReadRef(), kNoBarrier);
+        object->init_element(j, d->ReadRef());
       }
     }
   }
@@ -163,7 +168,7 @@ class WeakArrayCluster : public Cluster {
       WeakArray object = WeakArray::Cast(d->Ref(i));
       intptr_t size = object->Size();
       for (intptr_t j = 0; j < size; j++) {
-        object->set_element(j, d->ReadRef(), kNoBarrier);
+        object->init_element(j, d->ReadRef());
       }
     }
   }
@@ -190,14 +195,13 @@ class ClosureCluster : public Cluster {
     for (intptr_t i = ref_start_; i < ref_stop_; i++) {
       Closure object = Closure::Cast(d->Ref(i));
 
-      object->set_defining_activation(Activation::Cast(d->ReadRef()),
-                                      kNoBarrier);
-      object->set_initial_bci(static_cast<SmallInteger>(d->ReadRef()));
-      object->set_num_args(static_cast<SmallInteger>(d->ReadRef()));
+      object->init_defining_activation(Activation::Cast(d->ReadRef()));
+      object->init_initial_bci(static_cast<SmallInteger>(d->ReadRef()));
+      object->init_num_args(static_cast<SmallInteger>(d->ReadRef()));
 
       intptr_t size = object->NumCopied();
       for (intptr_t j = 0; j < size; j++) {
-        object->set_copied(j, d->ReadRef(), kNoBarrier);
+        object->init_copied(j, d->ReadRef());
       }
     }
   }
@@ -224,21 +228,21 @@ class ActivationCluster : public Cluster {
     for (intptr_t i = ref_start_; i < ref_stop_; i++) {
       Activation object = Activation::Cast(d->Ref(i));
 
-      object->set_sender(Activation::Cast(d->ReadRef()), kNoBarrier);
-      object->set_bci(static_cast<SmallInteger>(d->ReadRef()));
-      object->set_method(Method::Cast(d->ReadRef()), kNoBarrier);
-      object->set_closure(Closure::Cast(d->ReadRef()), kNoBarrier);
-      object->set_receiver(d->ReadRef(), kNoBarrier);
+      object->init_sender(Activation::Cast(d->ReadRef()));
+      object->init_bci(static_cast<SmallInteger>(d->ReadRef()));
+      object->init_method(Method::Cast(d->ReadRef()));
+      object->init_closure(Closure::Cast(d->ReadRef()));
+      object->init_receiver(d->ReadRef());
 
       intptr_t size = d->ReadUint16();
       ASSERT(size < kMaxTemps);
-      object->set_stack_depth(SmallInteger::New(size));
+      object->init_stack_depth(SmallInteger::New(size));
 
       for (intptr_t j = 0; j < size; j++) {
-        object->set_temp(j, d->ReadRef(), kNoBarrier);
+        object->init_temp(j, d->ReadRef());
       }
       for (intptr_t j = size; j < kMaxTemps; j++) {
-        object->set_temp(j, SmallInteger::New(0), kNoBarrier);
+        object->init_temp(j, SmallInteger::New(0));
       }
     }
   }
@@ -363,6 +367,9 @@ void Deserializer::Deserialize() {
   for (intptr_t i = 0; i < num_clusters_; i++) {
     clusters_[i]->ReadEdges(this, heap_);
   }
+  for (intptr_t i = 0; i < num_clusters_; i++) {
+    clusters_[i]->PostLoad(heap_);
+  }
 
   ObjectStore os = static_cast<ObjectStore>(ReadRef());
 
@@ -394,7 +401,7 @@ void Deserializer::Deserialize() {
                  time / kNanosecondsPerMicrosecond);
   }
 
-#if defined(DEBUG)
+#if 0 && defined(DEBUG)
   size_t before = heap_->Size();
   heap_->CollectAll(Heap::kSnapshotTest);
   size_t after = heap_->Size();
